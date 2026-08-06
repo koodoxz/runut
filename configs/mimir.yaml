@@ -1,0 +1,53 @@
+# MIMIR-RS Configuration
+
+listen:
+  udp: "0.0.0.0:53"
+  tcp: "0.0.0.0:53"
+  # dot: "0.0.0.0:853"   # DNS-over-TLS (Phase 4)
+  # doh: "0.0.0.0:443"   # DNS-over-HTTPS (Phase 4)
+  # doq: "0.0.0.0:853"   # DNS-over-QUIC (Phase 4)
+
+# Resolution mode: "recursive" (from root) or "forward" (to upstream)
+mode: recursive
+
+# Recursive resolver config (used when mode = recursive)
+resolver:
+  timeout_ms: 5000
+  max_retries: 3
+  max_depth: 30
+  pool_size: 50
+
+# Upstream config (used when mode = forward)
+# Upstream config (unused in recursive mode)
+upstream:
+  servers: []
+  timeout_ms: 2000
+  tcp_fallback: true
+
+cache:
+  enabled: true
+  size: 50000
+  shards: 64
+  min_ttl: 60
+  max_ttl: 86400
+
+blocklist:
+  enabled: false
+  bloom_size: 1000000
+  sources:
+    - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+  refresh_interval_secs: 3600
+
+svalinn:
+  enabled: false
+  url: "https://your-shield-instance.example.com"
+  api_key: "${SVALINN_API_KEY}"
+  sync_interval_secs: 300
+
+metrics:
+  enabled: true
+  listen: "0.0.0.0:9153"
+
+logging:
+  level: "debug"
+  json: false

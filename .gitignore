@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock.bak
+
+# Precompiled/loaded binaries (regenerate with `cargo build --release`)
+/mimir
+/mimir-rs
+/mimir-xdp-ebpf
+/mimir-xdp-sync
+/xdp-sync-bridge-v2.7
+
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+!scripts/*.sh
+
+# Local build logs / scratch
+build_log.txt
+*.log
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Packaged archives (build output, not source)
+*.tar.gz

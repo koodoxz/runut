@@ -1,0 +1,22 @@
+[package]
+name = "mimir-xdp-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+aya-log-ebpf = "0.1"
+
+[[bin]]
+name = "mimir-xdp-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+
+[profile.release]
+opt-level = 3
+lto = true

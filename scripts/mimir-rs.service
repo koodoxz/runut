@@ -1,0 +1,29 @@
+[Unit]
+Description=MIMIR-RS Ultra Fast DNS Guardian
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/mimir-rs/mimir --config /opt/mimir-rs/mimir.yaml --workers 0
+Restart=always
+RestartSec=3
+
+# Performance tuning
+LimitNOFILE=1048576
+LimitNPROC=1048576
+LimitCORE=infinity
+
+# Security hardening (optional - enable for production)
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ProtectHome=true
+# ReadWritePaths=/opt/mimir-rs /var/log
+
+# CPU affinity (uncomment for multi-core)
+# CPUAffinity=0-7
+
+[Install]
+WantedBy=multi-user.target
