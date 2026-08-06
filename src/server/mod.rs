@@ -435,8 +435,20 @@ impl DnsServer {
         // DGA (Domain Generation Algorithm) heuristic detection --
         // alert-only, logs and counts, never blocks or alters resolution.
         // MIMIR-DGA-DETECT-001.
+        //
+        // Scored from raw wire-format label bytes (Name::iter()), NOT
+        // query_name's display string -- trust-dns IDNA-decodes/unescapes
+        // labels when formatting that string, which can desync a
+        // dot-delimited parse and let an attacker manufacture an arbitrary
+        // score. See dga.rs's doc comment on `score` for the full
+        // rationale. MIMIR-DGA-DETECT-001.
         if self.config.dga.enabled {
-            if let Some(dga_score) = dga::score(&query_name) {
+            let query_labels: Vec<&[u8]> = message
+                .queries()
+                .first()
+                .map(|q| q.name().iter().collect())
+                .unwrap_or_default();
+            if let Some(dga_score) = dga::score(&query_labels) {
                 if dga_score.score >= self.config.dga.threshold {
                     self.stats.inc_dga_suspected();
                     // query_name/label are attacker-controlled and can contain
