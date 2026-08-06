@@ -29,6 +29,7 @@ directional, not a guarantee.*
 - 💾 **Sharded Cache** - Lock-free concurrent LRU
 - 🔒 **Bloom Filter** - O(1) blocklist lookup
 - 🔗 **Threat-Feed Integration** - Real-time threat sync with a compatible WAF/shield backend (e.g. [Tameng](https://github.com/koodoxz/tameng))
+- 🧬 **DGA Detection** - Heuristic scoring for algorithmically-generated domains, alert-only, disabled by default
 - 📊 **Prometheus Metrics** - Full observability
 
 ## Quick Start
@@ -77,6 +78,12 @@ svalinn:
   url: "https://your-shield-instance.example.com"
   api_key: "${SVALINN_API_KEY}"
   sync_interval_secs: 300
+
+# DGA (Domain Generation Algorithm) heuristic detection -- alert-only,
+# logs a warning and increments a counter, never blocks a query.
+dga:
+  enabled: false
+  threshold: 0.5
 
 metrics:
   enabled: true
