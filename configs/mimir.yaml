@@ -44,10 +44,17 @@ svalinn:
   api_key: "${SVALINN_API_KEY}"
   sync_interval_secs: 300
 
+# DGA (Domain Generation Algorithm) heuristic detection -- alert-only, logs
+# a warning and increments a counter, never blocks a query. Disabled by
+# default; a new detector on a resolver should be an explicit opt-in.
+dga:
+  enabled: false
+  threshold: 0.5
+
 metrics:
   enabled: true
   listen: "0.0.0.0:9153"
 
 logging:
-  level: "debug"
+  level: "info"
   json: false
