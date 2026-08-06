@@ -18,6 +18,10 @@ High-performance DNS Guardian rebuilt from scratch in Rust. Zero GC, predictable
 | P99 | 8ms | **<1ms** | 8x |
 | Memory | 81MB | **<30MB** | 3x |
 
+*Self-reported, single-operator benchmark against an earlier internal Go
+implementation — not independently reproduced or peer-reviewed. Treat as
+directional, not a guarantee.*
+
 ## Features
 
 - ⚡ **Zero GC** - Predictable sub-millisecond latency
