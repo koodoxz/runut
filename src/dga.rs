@@ -10,8 +10,8 @@
 //! false-positiving on legitimate but random-looking CDN/cloud subdomains
 //! (e.g. "d1a2b3c4.cloudfront.net" scores on "cloudfront", not "d1a2b3c4").
 //! ponytail: subdomain-level scoring (needed for DNS-tunneling detection,
-//! not DGA) is a separate, not-yet-built feature -- see REQ
-//! MIMIR-DNS-TUNNEL-DETECT-001 (not started).
+//! not DGA) is a separate, already-built feature -- see `tunnel.rs`, REQ
+//! MIMIR-DNS-TUNNEL-DETECT-001.
 //!
 //! Operates on raw wire-format DNS label bytes (e.g. from iterating a
 //! `trust_dns_proto::rr::Name`), not a pre-formatted display string -- see
@@ -103,7 +103,86 @@ fn registrable_label(labels: &[&[u8]]) -> Option<Vec<u8>> {
     Some(owned)
 }
 
-fn shannon_entropy(s: &str) -> f64 {
+/// Splits raw wire-format DNS label bytes into (subdomain labels,
+/// registrable domain), using the same known-multi-label-suffix logic as
+/// `registrable_label` above (does not duplicate `KNOWN_MULTI_LABEL_SUFFIXES`
+/// or `matches_known_multi_label_suffix`). "Subdomain labels" is everything
+/// more specific than the registrable domain, most-specific label first --
+/// for `[b"data1", b"aGVsbG8", b"evil", b"com"]` this returns
+/// (`[b"data1", b"agvsbg8"]`, `[b"evil", b"com"]`). Returns `None` under the
+/// same conditions `registrable_label` does (fewer than 2 non-empty labels).
+///
+/// Built for REQ MIMIR-DNS-TUNNEL-DETECT-001 (see tunnel.rs), which needs to
+/// key a per-domain tracker on the registrable domain while separately
+/// hashing the more-specific subdomain chain above it.
+///
+/// # Why the registrable domain is `Vec<Vec<u8>>`, not a joined `Vec<u8>`
+///
+/// A dot-joined byte string was considered and rejected. `dga.rs`'s own
+/// `score` and `svalinn::build_alert_domain` both have extensive doc
+/// comments/regression tests establishing that joining raw wire-format
+/// labels with a literal `.` byte is unsafe in general: RFC 1035 labels are
+/// length-prefixed, not dot-delimited, so a literal `.` (or `\`) byte
+/// legally inside ONE label is indistinguishable from a real label-boundary
+/// separator once joined, unless it is escaped first (which is exactly what
+/// `build_alert_domain` does for *display/logging* purposes). Reusing that
+/// escaping here just to build an internal map key would be solving a
+/// problem this function doesn't have: `Vec<Vec<u8>>` is `Hash + Eq` with no
+/// join step at all, so each element unambiguously round-trips as exactly
+/// the label it came from -- no delimiter, no escaping, no desync surface.
+/// Callers that need a safe *display* string for logging (e.g.
+/// `tunnel::evaluate`) still go through `svalinn::build_alert_domain`
+/// separately for that purpose.
+///
+/// Both the subdomain and registrable label bytes returned are
+/// ASCII-lowercased (DNS labels are ASCII case-insensitive, matching
+/// `registrable_label`'s own behavior) -- this keeps `0x20`-style
+/// case-randomized queries for the same logical name from being counted as
+/// artificially distinct by `tunnel::TunnelTracker`.
+pub(crate) fn split_subdomain_and_registrable(labels: &[&[u8]]) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    let filtered: Vec<&[u8]> = labels.iter().copied().filter(|l| !l.is_empty()).collect();
+    if filtered.len() < 2 {
+        return None;
+    }
+
+    // Same decision `registrable_label` makes: 3 trailing labels form the
+    // registrable domain when the known multi-label-suffix pattern matches
+    // (e.g. "evil.co.uk"), otherwise 2 (the common case, e.g.
+    // "example.com"). `registrable_len` is always <= filtered.len() here:
+    // when filtered.len() == 2 the suffix branch is skipped entirely (it
+    // requires >= 3 to even check), so registrable_len stays 2.
+    let registrable_len = if filtered.len() >= 3 {
+        let last = filtered[filtered.len() - 1];
+        let second_last = filtered[filtered.len() - 2];
+        if matches_known_multi_label_suffix(second_last, last) {
+            3
+        } else {
+            2
+        }
+    } else {
+        2
+    };
+    let split_at = filtered.len() - registrable_len;
+
+    let lowercase = |label: &&[u8]| {
+        let mut owned = label.to_vec();
+        owned.make_ascii_lowercase();
+        owned
+    };
+    let subdomain_labels: Vec<Vec<u8>> = filtered[..split_at].iter().map(lowercase).collect();
+    let registrable_labels: Vec<Vec<u8>> = filtered[split_at..].iter().map(lowercase).collect();
+
+    Some((subdomain_labels, registrable_labels))
+}
+
+/// Shannon entropy of `s`, in bits per character over the character
+/// frequency distribution. `pub(crate)`: reused directly by
+/// `tunnel::evaluate` (MIMIR-DNS-TUNNEL-DETECT-001) to avoid a second copy
+/// of this math -- see this file's module doc comment for why
+/// tunnel-detection was deliberately kept out of the original DGA REQ, and
+/// tunnel.rs for why it computes entropy over the full concatenated
+/// subdomain chain rather than a single label.
+pub(crate) fn shannon_entropy(s: &str) -> f64 {
     if s.is_empty() {
         return 0.0;
     }
@@ -141,7 +220,12 @@ fn shannon_entropy(s: &str) -> f64 {
 /// a newly hand-picked number -- it is the same bar, just expressed
 /// relative to what is achievable at that length. Shorter labels get a
 /// proportionally lower absolute bar, which is the intended fix.
-fn entropy_ratio(s: &str, len: usize) -> f64 {
+///
+/// `pub(crate)`: reused directly by `tunnel::evaluate`
+/// (MIMIR-DNS-TUNNEL-DETECT-001) for the same length-scaled-ceiling reason
+/// this was originally written for, applied to a subdomain chain instead of
+/// a single registrable label -- see `shannon_entropy`'s doc comment.
+pub(crate) fn entropy_ratio(s: &str, len: usize) -> f64 {
     if len < 2 {
         return 0.0;
     }
@@ -156,7 +240,12 @@ fn entropy_ratio(s: &str, len: usize) -> f64 {
 /// module's original absolute threshold: `3.5 / log2(DGA_ALPHABET_SIZE)`.
 /// Computed rather than hardcoded to avoid a second, drift-prone copy of
 /// the derivation living next to the comment that explains it.
-fn high_entropy_ratio_threshold() -> f64 {
+///
+/// `pub(crate)`: reused directly by `tunnel::evaluate`
+/// (MIMIR-DNS-TUNNEL-DETECT-001) as the trigger bar for its own
+/// `high_entropy_subdomain_chain` corroborating reason, rather than a second
+/// independently-hand-picked threshold living next to this one.
+pub(crate) fn high_entropy_ratio_threshold() -> f64 {
     3.5 / (DGA_ALPHABET_SIZE as f64).log2()
 }
 
@@ -518,6 +607,109 @@ mod tests {
             "the registrable label scored must be the full, un-fragmented \
              wire-format label, not a piece a naive splitter would see"
         );
+    }
+
+    // ---- split_subdomain_and_registrable (MIMIR-DNS-TUNNEL-DETECT-001) ----
+    // Written before the implementation (TDD red phase) -- see this file's
+    // module doc comment for why tunnel detection was deliberately deferred
+    // out of the original DGA REQ, and tunnel.rs's module doc comment for
+    // the full distinct-subdomain-count design this function feeds.
+
+    #[test]
+    fn split_basic_three_label_domain() {
+        let labels: [&[u8]; 3] = [b"www", b"example", b"com"];
+        let (subdomain, registrable) = split_subdomain_and_registrable(&labels).unwrap();
+        assert_eq!(subdomain, vec![b"www".to_vec()]);
+        assert_eq!(registrable, vec![b"example".to_vec(), b"com".to_vec()]);
+    }
+
+    #[test]
+    fn split_multi_label_suffix_puts_everything_in_registrable() {
+        // "evil.co.uk." -- the known multi-label-suffix case. Registrable
+        // domain is all 3 labels; nothing left over as "subdomain".
+        let labels: [&[u8]; 3] = [b"evil", b"co", b"uk"];
+        let (subdomain, registrable) = split_subdomain_and_registrable(&labels).unwrap();
+        assert!(subdomain.is_empty());
+        assert_eq!(
+            registrable,
+            vec![b"evil".to_vec(), b"co".to_vec(), b"uk".to_vec()]
+        );
+    }
+
+    #[test]
+    fn split_four_plus_labels_with_real_subdomain_data() {
+        // Matches the exact example in the REQ spec:
+        // [data1, aGVsbG8, evil, com] -> subdomain=[data1, aGVsbG8],
+        // registrable=[evil, com]. "evil.com" is not a known multi-label
+        // suffix, so the split falls back to the last 2 labels.
+        let labels: [&[u8]; 4] = [b"data1", b"aGVsbG8", b"evil", b"com"];
+        let (subdomain, registrable) = split_subdomain_and_registrable(&labels).unwrap();
+        assert_eq!(
+            subdomain,
+            vec![b"data1".to_vec(), b"agvsbg8".to_vec()],
+            "subdomain labels should be lowercased, most-specific first"
+        );
+        assert_eq!(registrable, vec![b"evil".to_vec(), b"com".to_vec()]);
+    }
+
+    #[test]
+    fn split_many_label_tunneling_style_chain() {
+        // A longer, more realistic tunneling-style chain of subdomain
+        // labels under one registrable domain.
+        let labels: [&[u8]; 6] = [
+            b"aGVsbG8gd29ybGQ",
+            b"c2Vjb25kY2h1bms",
+            b"dGhpcmRjaHVuaw",
+            b"Zm91cnRoY2h1bms",
+            b"attacker",
+            b"com",
+        ];
+        let (subdomain, registrable) = split_subdomain_and_registrable(&labels).unwrap();
+        assert_eq!(subdomain.len(), 4);
+        assert_eq!(registrable, vec![b"attacker".to_vec(), b"com".to_vec()]);
+    }
+
+    #[test]
+    fn split_returns_none_for_fewer_than_two_labels() {
+        assert_eq!(split_subdomain_and_registrable(&[]), None);
+        assert_eq!(split_subdomain_and_registrable(&[b"localhost"]), None);
+        assert_eq!(split_subdomain_and_registrable(&[b""]), None);
+    }
+
+    #[test]
+    fn split_two_label_domain_has_no_subdomain() {
+        // No label deeper than the registrable domain itself.
+        let labels: [&[u8]; 2] = [b"example", b"com"];
+        let (subdomain, registrable) = split_subdomain_and_registrable(&labels).unwrap();
+        assert!(subdomain.is_empty());
+        assert_eq!(registrable, vec![b"example".to_vec(), b"com".to_vec()]);
+    }
+
+    #[test]
+    fn split_does_not_panic_on_adversarial_raw_label_bytes() {
+        // Mirrors `no_panic_on_adversarial_raw_label_bytes` above, applied
+        // to the new entry point.
+        let all_ff_63: Vec<u8> = vec![0xFFu8; 63];
+        let with_nul: Vec<u8> = vec![b'a', 0x00, b'b', 0x00, b'c'];
+        let empty: Vec<u8> = vec![];
+        let mixed_invalid_utf8: Vec<u8> = vec![0xC0, 0xC1, 0xF5, 0xFF, 0xFE];
+
+        let candidate_labels: Vec<&[u8]> = vec![
+            &all_ff_63,
+            &with_nul,
+            &empty,
+            &mixed_invalid_utf8,
+            b"com",
+            b"",
+            b"a",
+        ];
+
+        let _ = split_subdomain_and_registrable(&candidate_labels);
+        let _ = split_subdomain_and_registrable(&[&all_ff_63, b"com"]);
+        let _ = split_subdomain_and_registrable(&[&with_nul, &with_nul, &with_nul, b"co", b"uk"]);
+        let _ = split_subdomain_and_registrable(&[&empty, &empty]);
+        let _ = split_subdomain_and_registrable(&[]);
+        let _ = split_subdomain_and_registrable(&[b""]);
     }
 
     #[test]

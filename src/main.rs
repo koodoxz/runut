@@ -21,6 +21,7 @@ mod forwarder;
 mod metrics;
 mod resolver;  // Recursive resolver (NO 3rd-party upstream)
 mod svalinn;
+mod tunnel;
 mod xdp;
 
 use config::Config;
@@ -248,6 +249,7 @@ impl Default for Config {
             blocklist: Default::default(),
             dga: Default::default(),
             svalinn: Default::default(),
+            tunnel: Default::default(),
             metrics: Default::default(),
             logging: Default::default(),
             tls: None,

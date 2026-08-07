@@ -23,6 +23,7 @@ use crate::filter::BlockFilter;
 use crate::forwarder::DnsForwarder;
 use crate::resolver::{Resolver, ResolverConfig};
 use crate::svalinn::{self, DnsEvent};
+use crate::tunnel;
 use crate::xdp::XdpSyncClient;
 
 /// Resolution backend
@@ -78,6 +79,34 @@ pub struct DnsServer {
     // later infected host invisible to SVALINN's actor tracking (found in
     // review, MEDIUM-1). This cache exists solely to fix that.
     svalinn_send_seen: parking_lot::Mutex<lru::LruCache<(IpAddr, String), ()>>,
+    // DNS-tunneling detection state (MIMIR-DNS-TUNNEL-DETECT-001). `None`
+    // when tunnel.enabled is false -- zero memory allocated for the
+    // per-domain LRU tracker in that (default) state, matching
+    // `svalinn_client`'s Option-gated "zero overhead when disabled" pattern
+    // rather than `dga_alert_seen`'s unconditional allocation. Chosen
+    // because `tunnel_tracker`'s capacity is operator-configurable and can
+    // be materially larger than `dga_alert_seen`'s small hardcoded 10_000
+    // (it holds an outer LRU of up to `tracker_outer_capacity` *inner* LRUs
+    // each up to `tracker_inner_capacity`), so the case for not paying that
+    // cost at all when disabled is stronger here.
+    tunnel_tracker: Option<tunnel::TunnelTracker>,
+    // Log-flood dedup for the local `warn!` line in the tunnel detection
+    // block, keyed on registrable domain -- structurally the same pattern
+    // as `dga_alert_seen` above (unconditionally allocated, small fixed
+    // hardcoded capacity), just keyed on a different attacker-controlled
+    // string. See `dga_alert_seen`'s field doc comment for the rationale
+    // this mirrors.
+    tunnel_alert_seen: parking_lot::Mutex<lru::LruCache<String, ()>>,
+    // Second, narrower dedup for the tunnel SVALINN send path, mirroring
+    // `svalinn_send_seen` above but keyed on (client_ip, registrable_domain)
+    // instead of (client_ip, DGA label) -- kept as its own field/LRU rather
+    // than sharing `svalinn_send_seen` so a DGA event and a tunnel event for
+    // the same underlying domain/client don't spuriously dedup against each
+    // other (they are different event types with independent send
+    // decisions). See `maybe_send_svalinn_tunnel_event`'s doc comment for
+    // why this is a duplicated function rather than a shared refactor of
+    // `maybe_send_svalinn_dga_event`.
+    tunnel_svalinn_send_seen: parking_lot::Mutex<lru::LruCache<(IpAddr, String), ()>>,
 }
 
 /// Maximum number of concurrent outbound SVALINN DGA-event POSTs. Chosen as
@@ -95,6 +124,16 @@ const SVALINN_MAX_INFLIGHT: usize = 32;
 /// accepted imprecision favoring a hard memory bound over unbounded growth.
 const SVALINN_SEND_DEDUP_CAPACITY: usize = 10_000;
 
+/// Capacity of `tunnel_alert_seen`, the local-log dedup LRU for the tunnel
+/// detection block. Same order of magnitude as `dga_alert_seen`'s 10_000,
+/// same fixed-bound-not-time-windowed rationale.
+const TUNNEL_ALERT_DEDUP_CAPACITY: usize = 10_000;
+
+/// Capacity of `tunnel_svalinn_send_seen`, the (client_ip, registrable
+/// domain) dedup cache that gates tunnel SVALINN sends. Same order of
+/// magnitude and rationale as `SVALINN_SEND_DEDUP_CAPACITY` above.
+const TUNNEL_SVALINN_SEND_DEDUP_CAPACITY: usize = 10_000;
+
 /// Server statistics
 pub struct ServerStats {
     pub queries_total: std::sync::atomic::AtomicU64,
@@ -103,6 +142,10 @@ pub struct ServerStats {
     pub queries_forwarded: std::sync::atomic::AtomicU64,
     pub queries_failed: std::sync::atomic::AtomicU64,
     pub queries_dga_suspected: std::sync::atomic::AtomicU64,
+    // Count of queries whose registrable domain's distinct-subdomain-chain
+    // count crossed the tunnel.distinct_subdomain_threshold gate. See
+    // src/tunnel.rs. MIMIR-DNS-TUNNEL-DETECT-001.
+    pub queries_tunnel_suspected: std::sync::atomic::AtomicU64,
     // Count of DGA events that were NOT sent to SVALINN because the
     // concurrency gate (`svalinn_inflight`, HIGH-1) was full at the moment
     // of decision -- distinct from a send that was attempted and failed
@@ -137,6 +180,7 @@ impl ServerStats {
             queries_forwarded: std::sync::atomic::AtomicU64::new(0),
             queries_failed: std::sync::atomic::AtomicU64::new(0),
             queries_dga_suspected: std::sync::atomic::AtomicU64::new(0),
+            queries_tunnel_suspected: std::sync::atomic::AtomicU64::new(0),
             svalinn_events_dropped: std::sync::atomic::AtomicU64::new(0),
             svalinn_events_skipped_invalid_utf8: std::sync::atomic::AtomicU64::new(0),
             latency_bucket_0_1ms: std::sync::atomic::AtomicU64::new(0),
@@ -171,6 +215,10 @@ impl ServerStats {
 
     pub fn inc_dga_suspected(&self) {
         self.queries_dga_suspected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn inc_tunnel_suspected(&self) {
+        self.queries_tunnel_suspected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn inc_svalinn_events_dropped(&self) {
@@ -292,6 +340,30 @@ impl DnsServer {
             info!("SVALINN DGA event forwarding: disabled");
         }
 
+        // `None` when tunnel.enabled is false -- see `tunnel_tracker`'s
+        // field doc comment for why this follows `svalinn_client`'s
+        // Option-gated pattern rather than `dga_alert_seen`'s unconditional
+        // allocation. Capacities are validated > 0 at config load
+        // (config.rs), so `TunnelTracker::new`'s internal
+        // `NonZeroUsize::new(...).expect(...)` cannot fail here.
+        let tunnel_tracker = if config.tunnel.enabled {
+            Some(tunnel::TunnelTracker::new(
+                config.tunnel.tracker_outer_capacity,
+                config.tunnel.tracker_inner_capacity,
+            ))
+        } else {
+            None
+        };
+
+        if config.tunnel.enabled {
+            info!(
+                "DNS-tunneling detection: enabled (distinct_subdomain_threshold={})",
+                config.tunnel.distinct_subdomain_threshold
+            );
+        } else {
+            info!("DNS-tunneling detection: disabled");
+        }
+
         Ok(Self {
             config,
             cache,
@@ -307,6 +379,13 @@ impl DnsServer {
             svalinn_inflight: Arc::new(tokio::sync::Semaphore::new(SVALINN_MAX_INFLIGHT)),
             svalinn_send_seen: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(SVALINN_SEND_DEDUP_CAPACITY).unwrap(),
+            )),
+            tunnel_tracker,
+            tunnel_alert_seen: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(TUNNEL_ALERT_DEDUP_CAPACITY).unwrap(),
+            )),
+            tunnel_svalinn_send_seen: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(TUNNEL_SVALINN_SEND_DEDUP_CAPACITY).unwrap(),
             )),
         })
     }
@@ -675,6 +754,82 @@ impl DnsServer {
             }
         }
 
+        // DNS-tunneling heuristic detection -- alert-only, logs and counts,
+        // never blocks or alters resolution. MIMIR-DNS-TUNNEL-DETECT-001.
+        //
+        // Deliberately an independent `if` block, NOT nested inside or
+        // dependent on the DGA block above running/firing -- a deployment
+        // could run with `dga.enabled: false, tunnel.enabled: true`. The
+        // 5-line `query_labels` extraction below duplicates the DGA block's
+        // own extraction rather than hoisting it into a shared local: that
+        // would touch the DGA block's already-reviewed/hardened code path
+        // for a trivial saving, which is not worth the risk here.
+        //
+        // See tunnel.rs's module doc comment for why distinct-subdomain
+        // count (not per-query entropy) is this detector's primary trigger.
+        if self.config.tunnel.enabled {
+            if let Some(tracker) = self.tunnel_tracker.as_ref() {
+                let query_labels: Vec<&[u8]> = message
+                    .queries()
+                    .first()
+                    .map(|q| q.name().iter().collect())
+                    .unwrap_or_default();
+
+                if let Some(tunnel_score) = tunnel::evaluate(
+                    tracker,
+                    &query_labels,
+                    qtype,
+                    self.config.tunnel.distinct_subdomain_threshold,
+                ) {
+                    self.stats.inc_tunnel_suspected();
+
+                    // query_name/registrable_domain/reasons are
+                    // attacker-controlled -- Debug-escape all of them in
+                    // this log line, matching the DGA block's own defense
+                    // against forged log lines. `tunnel_score.registrable_domain`
+                    // is already escaped by `svalinn::build_alert_domain`
+                    // (see tunnel.rs's `evaluate`), but `{:?}` here is kept
+                    // as defense-in-depth rather than trusted alone -- same
+                    // reasoning the DGA block's own comment gives for its
+                    // `label` field, which is also somewhat pre-sanitized.
+                    //
+                    // Dedup on the registrable domain before logging, same
+                    // log-flood rationale as `dga_alert_seen` above. This
+                    // gate controls ONLY the local `warn!` line's volume. It
+                    // must NOT also gate whether SVALINN gets notified below
+                    // -- see `maybe_send_svalinn_dga_event`'s doc comment
+                    // for the exact nesting bug (round-3 fix) this must not
+                    // reintroduce for tunnel events.
+                    let already_seen = self
+                        .tunnel_alert_seen
+                        .lock()
+                        .put(tunnel_score.registrable_domain.clone(), ())
+                        .is_some();
+                    if !already_seen {
+                        warn!(
+                            "DNS tunneling suspected: {:?} domain={:?} \
+                             distinct_subdomains={} score={:.2} reasons={:?}",
+                            query_name,
+                            tunnel_score.registrable_domain,
+                            tunnel_score.distinct_count,
+                            tunnel_score.score,
+                            tunnel_score.reasons
+                        );
+                    }
+
+                    // Forward to SVALINN unconditionally -- independent of
+                    // `already_seen` above, same reasoning as the DGA
+                    // block. Gated on `svalinn_client.is_some()` first so
+                    // this call site pays zero extra allocation when
+                    // SVALINN is disabled (the default), mirroring the DGA
+                    // block's own round-4 (NEW-3) fix.
+                    if self.svalinn_client.is_some() {
+                        self.maybe_send_svalinn_tunnel_event(client_addr, &tunnel_score);
+                    }
+                }
+            }
+        }
+
         // Check blocklist
         if self.config.blocklist.enabled && self.filter.is_blocked(&query_name) {
             self.stats.inc_blocked();
@@ -942,6 +1097,130 @@ impl DnsServer {
         });
     }
 
+    /// Fire-and-forget forward of a DNS-tunneling alert to SVALINN as a
+    /// `DnsEvent` POST, `event_type: "tunnel"` (an already-documented
+    /// accepted value on the receiver, github.com/aegis/svalinn -- no
+    /// receiver-side change needed).
+    ///
+    /// This is a deliberate ~30-line duplicate of
+    /// `maybe_send_svalinn_dga_event` rather than a shared refactor of its
+    /// internals. `maybe_send_svalinn_dga_event`'s doc comment documents,
+    /// in detail, the single most severe finding across this codebase's
+    /// entire DGA/SvalinnConfig review chain: a nesting bug where the
+    /// SVALINN send was accidentally placed inside the local log-dedup
+    /// `if`, silently making the send unreachable for every client after
+    /// the first. Refactoring that function's internals to be generic over
+    /// event type would mean re-deriving and re-verifying that exact
+    /// ordering/nesting guarantee from scratch for a second event type,
+    /// with no existing test coverage for the refactored shape to fall
+    /// back on. Duplicating the (already small) function keeps the DGA
+    /// path's hardened code completely untouched and lets this function be
+    /// verified independently (see the round-3-style regression test for
+    /// this path below in the test module) -- a smaller, more isolated
+    /// blast radius than a shared-helper refactor, at the cost of ~30 lines
+    /// of near-identical code. Shared, generic infrastructure --
+    /// `svalinn_client`, `svalinn_inflight`, `svalinn_failure_gate` -- IS
+    /// reused as-is (it was already event-type-agnostic); only the
+    /// dedup LRU (`tunnel_svalinn_send_seen`, keyed on registrable domain
+    /// rather than DGA label) and the `DnsEvent` construction are
+    /// duplicated.
+    ///
+    /// Same gates, same order, same rationale as
+    /// `maybe_send_svalinn_dga_event`: disabled-client check, then real
+    /// `client_addr` check, then the non-blocking `svalinn_inflight`
+    /// concurrency gate, then the (client_ip, registrable_domain) dedup --
+    /// only marked "sent" once a permit is actually held, so a gate-full
+    /// drop never poisons the dedup LRU. See that function's doc comment
+    /// for the full explanation of each gate; not re-derived here to avoid
+    /// two copies of the same reasoning drifting apart.
+    fn maybe_send_svalinn_tunnel_event(
+        &self,
+        client_addr: Option<SocketAddr>,
+        tunnel_score: &tunnel::TunnelScore,
+    ) {
+        let Some(client) = self.svalinn_client.clone() else {
+            return;
+        };
+        let Some(addr) = client_addr else {
+            debug!(
+                "Skipping SVALINN tunnel event: no real client address available \
+                 at this protocol path"
+            );
+            return;
+        };
+
+        let Ok(permit) = self.svalinn_inflight.clone().try_acquire_owned() else {
+            self.stats.inc_svalinn_events_dropped();
+            debug!(
+                "Dropping SVALINN tunnel event: {} concurrent forwards already \
+                 in flight (gate full)",
+                SVALINN_MAX_INFLIGHT
+            );
+            return;
+        };
+
+        let send_key = (addr.ip(), tunnel_score.registrable_domain.clone());
+        let already_sent_for_client = self
+            .tunnel_svalinn_send_seen
+            .lock()
+            .put(send_key, ())
+            .is_some();
+        if already_sent_for_client {
+            return;
+        }
+
+        let url = svalinn::build_dns_events_url(&self.config.svalinn.url);
+        let api_key = self.config.svalinn.api_key.clone();
+        let failure_gate = self.svalinn_failure_gate.clone();
+
+        let event = DnsEvent {
+            event_type: "tunnel".to_string(),
+            client_ip: addr.ip().to_string(),
+            domain: tunnel_score.registrable_domain.clone(),
+            score: tunnel_score.score,
+            reason: tunnel_score.reasons.join(","),
+            actor_id: None,
+            timestamp: None,
+            source: Some("mimir".to_string()),
+        };
+
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&event)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    debug!("SVALINN tunnel event delivered: status={}", resp.status());
+                }
+                Ok(resp) => {
+                    if svalinn::should_log_svalinn_failure(&failure_gate) {
+                        warn!(
+                            "SVALINN tunnel event rejected: status={} (further \
+                             failures suppressed briefly to avoid log flood \
+                             during an extended SVALINN outage)",
+                            resp.status()
+                        );
+                    }
+                }
+                Err(e) => {
+                    if svalinn::should_log_svalinn_failure(&failure_gate) {
+                        warn!(
+                            "SVALINN tunnel event send failed: {} (further \
+                             failures suppressed briefly to avoid log flood \
+                             during an extended SVALINN outage)",
+                            e
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     fn build_servfail(&self, query: &Message) -> Result<Bytes> {
         let mut response = query.clone();
         response.set_message_type(MessageType::Response);
@@ -1004,7 +1283,10 @@ impl DnsServer {
                              # HELP mimir_queries_dga_suspected Queries whose domain scored above the DGA suspicion threshold\n\
                              # TYPE mimir_queries_dga_suspected counter\n\
                              mimir_queries_dga_suspected {}\n\
-                             # HELP mimir_svalinn_events_dropped DGA events dropped without sending because the SVALINN concurrency gate was full\n\
+                             # HELP mimir_queries_tunnel_suspected Queries whose registrable domain's distinct-subdomain count crossed the tunnel detection threshold\n\
+                             # TYPE mimir_queries_tunnel_suspected counter\n\
+                             mimir_queries_tunnel_suspected {}\n\
+                             # HELP mimir_svalinn_events_dropped DGA and DNS-tunneling events dropped without sending because the SVALINN concurrency gate was full\n\
                              # TYPE mimir_svalinn_events_dropped counter\n\
                              mimir_svalinn_events_dropped {}\n\
                              # HELP mimir_svalinn_events_skipped_invalid_utf8 DGA events never attempted because a wire label was not valid UTF-8\n\
@@ -1029,6 +1311,7 @@ impl DnsServer {
                             forwarded,
                             stats.queries_failed.load(std::sync::atomic::Ordering::Relaxed),
                             stats.queries_dga_suspected.load(std::sync::atomic::Ordering::Relaxed),
+                            stats.queries_tunnel_suspected.load(std::sync::atomic::Ordering::Relaxed),
                             stats.svalinn_events_dropped.load(std::sync::atomic::Ordering::Relaxed),
                             stats.svalinn_events_skipped_invalid_utf8.load(std::sync::atomic::Ordering::Relaxed),
                             cache_hit_rate,
@@ -1095,6 +1378,15 @@ mod tests {
             score: 0.9,
             label: label.to_string(),
             reasons: vec!["high_entropy"],
+        }
+    }
+
+    fn sample_tunnel_score(registrable_domain: &str) -> tunnel::TunnelScore {
+        tunnel::TunnelScore {
+            score: 0.9,
+            distinct_count: 30,
+            registrable_domain: registrable_domain.to_string(),
+            reasons: vec!["high_distinct_subdomain_count"],
         }
     }
 
@@ -1518,5 +1810,253 @@ mod tests {
             SVALINN_MAX_INFLIGHT,
             "disabled SVALINN must never consume a permit"
         );
+    }
+
+    // ---- Tunnel detection (MIMIR-DNS-TUNNEL-DETECT-001) ----
+    // Written to drive the REAL production call site
+    // (`handle_query_internal`), not `tunnel::evaluate` in isolation --
+    // per this codebase's own hard-won lesson from the DGA/SVALINN review
+    // chain (see `handle_query_internal_forwards_second_distinct_client_for_already_locally_logged_label`'s
+    // doc comment above): a test that only exercises the lower-level
+    // function can pass while the real wiring at the call site is broken.
+
+    /// `tunnel.enabled: true` with the given threshold, `svalinn.enabled:
+    /// true` (unreachable target, never awaited), resolution backed by an
+    /// unreachable upstream + short timeout -- same "fast, deterministic,
+    /// no real network dependency" shape as `fast_forward_config_with_dga`.
+    fn fast_forward_config_with_tunnel(threshold: u32) -> Config {
+        let yaml = format!(
+            "mode: forward\n\
+             upstream:\n\
+             \x20 servers:\n\
+             \x20   - \"192.0.2.1:53\"\n\
+             \x20 timeout_ms: 50\n\
+             tunnel:\n\
+             \x20 enabled: true\n\
+             \x20 distinct_subdomain_threshold: {threshold}\n\
+             svalinn:\n\
+             \x20 enabled: true\n\
+             \x20 url: \"http://127.0.0.1:9\"\n"
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    /// Real-call-site regression test: 5 queries from the same client, each
+    /// with a distinct subdomain under the same registrable domain,
+    /// threshold=3. The 3rd, 4th, and 5th queries push `distinct_count` to
+    /// 3, 4, 5 respectively (all >= threshold=3), so
+    /// `queries_tunnel_suspected` must increment on exactly those three,
+    /// not on the first two (below threshold) and not more than 5 times
+    /// total.
+    #[tokio::test]
+    async fn handle_query_internal_tunnel_suspected_counter_increments_via_real_call_site() {
+        let server = DnsServer::new(fast_forward_config_with_tunnel(3)).await.unwrap();
+        let addr: SocketAddr = "203.0.113.60:1".parse().unwrap();
+
+        let before = server
+            .stats
+            .queries_tunnel_suspected
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        for i in 0..5u32 {
+            let qname = format!("chunk{i}.evil.com");
+            let query_bytes = build_raw_dns_query(&qname);
+            let _ = server.handle_query_internal(query_bytes, Some(addr)).await;
+        }
+
+        let after = server
+            .stats
+            .queries_tunnel_suspected
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after,
+            before + 3,
+            "distinct_count crosses threshold=3 on the 3rd, 4th, and 5th \
+             distinct subdomain query (counts 1, 2 stay below threshold)"
+        );
+    }
+
+    /// Real-call-site regression test mirroring
+    /// `handle_query_internal_forwards_second_distinct_client_for_already_locally_logged_label`
+    /// above, for the tunnel path: two distinct clients querying the exact
+    /// same (registrable domain, subdomain chain) pair, threshold=1 so the
+    /// very first query already triggers. Client A's query causes the
+    /// local `warn!` to fire (first time seeing this registrable domain);
+    /// client B's identical query is suppressed by `tunnel_alert_seen`'s
+    /// dedup -- but per `maybe_send_svalinn_tunnel_event`'s doc comment,
+    /// that local-log dedup must NOT also gate the SVALINN send. Verified
+    /// via the same "pre-exhaust the concurrency gate, observe
+    /// `svalinn_events_dropped`" technique used throughout this file: if
+    /// client B's call does not reach `maybe_send_svalinn_tunnel_event`'s
+    /// gate at all (the exact bug class this guards against), the counter
+    /// simply does not move a second time.
+    #[tokio::test]
+    async fn handle_query_internal_tunnel_forwards_to_svalinn_independent_of_local_log_dedup() {
+        let server = DnsServer::new(fast_forward_config_with_tunnel(1)).await.unwrap();
+
+        let mut held_permits = Vec::new();
+        for _ in 0..SVALINN_MAX_INFLIGHT {
+            held_permits.push(
+                server
+                    .svalinn_inflight
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate should not be exhausted yet"),
+            );
+        }
+
+        let addr_a: SocketAddr = "203.0.113.70:1".parse().unwrap();
+        let addr_b: SocketAddr = "203.0.113.71:1".parse().unwrap();
+        let query_bytes = build_raw_dns_query("chunk1.evil.com");
+
+        let before = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let _ = server
+            .handle_query_internal(query_bytes.clone(), Some(addr_a))
+            .await;
+        let after_a = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after_a,
+            before + 1,
+            "client A's first query for this domain must reach the tunnel \
+             SVALINN send gate"
+        );
+
+        let _ = server
+            .handle_query_internal(query_bytes.clone(), Some(addr_b))
+            .await;
+        let after_b = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after_b,
+            after_a + 1,
+            "client B's query for the SAME (domain, subdomain chain) pair \
+             -- local warn suppressed by tunnel_alert_seen's dedup -- must \
+             STILL reach the SVALINN send gate; if this fails, the tunnel \
+             send path has regressed into the same nesting bug the DGA \
+             path was fixed for in round 3"
+        );
+
+        drop(held_permits);
+    }
+
+    /// `tunnel.enabled: false` (the default) must mean `tunnel_tracker` is
+    /// genuinely `None` -- no per-domain LRU tracker allocated -- mirroring
+    /// `svalinn_client_is_none_when_disabled` above for the analogous
+    /// Option-gated field.
+    #[tokio::test]
+    async fn tunnel_tracker_is_none_when_disabled() {
+        let server = DnsServer::new(disabled_config()).await.unwrap();
+        assert!(
+            server.tunnel_tracker.is_none(),
+            "tunnel_tracker must not be built when tunnel.enabled is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_tracker_is_some_when_enabled() {
+        let server = DnsServer::new(fast_forward_config_with_tunnel(30))
+            .await
+            .unwrap();
+        assert!(
+            server.tunnel_tracker.is_some(),
+            "tunnel_tracker must be built when tunnel.enabled is true"
+        );
+    }
+
+    /// MEDIUM-2 regression guard: `maybe_send_svalinn_tunnel_event`'s
+    /// concurrency-gate-before-dedup-mark ordering (verified correct by
+    /// independent review -- see that function's own doc comment) currently
+    /// has no dedicated test, meaning a future refactor could silently
+    /// reintroduce the round-3-class ordering bug (marking a (client_ip,
+    /// domain) pair as "sent" in `tunnel_svalinn_send_seen` BEFORE
+    /// confirming a permit was actually acquired) with green CI.
+    ///
+    /// Exhausts the concurrency gate, calls the function once for a given
+    /// (client_ip, domain) key -- must be dropped (gate-full, counted via
+    /// `svalinn_events_dropped`) and must NOT be marked "sent" in the dedup
+    /// cache -- then frees exactly one permit and calls again with the
+    /// EXACT SAME key: must succeed this time (consumes the freed permit),
+    /// proving the earlier gate-full drop did not permanently poison the
+    /// dedup cache for that key. Mirrors
+    /// `svalinn_inflight_gate_drops_event_and_counts_it_when_full`'s
+    /// pre-exhaust-the-gate technique.
+    #[tokio::test]
+    async fn tunnel_svalinn_send_gate_full_drop_does_not_poison_dedup_cache_for_retry() {
+        let server = DnsServer::new(fast_forward_config_with_tunnel(1)).await.unwrap();
+
+        // Pre-acquire every permit so the gate is exhausted before the
+        // function under test ever runs.
+        let mut held_permits = Vec::new();
+        for _ in 0..SVALINN_MAX_INFLIGHT {
+            held_permits.push(
+                server
+                    .svalinn_inflight
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate should not be exhausted yet"),
+            );
+        }
+        assert_eq!(server.svalinn_inflight.available_permits(), 0);
+
+        let addr: SocketAddr = "203.0.113.80:1".parse().unwrap();
+        let score = sample_tunnel_score("evil.example.com");
+
+        let dropped_before = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Gate is full: must be dropped, not sent, and NOT marked in the
+        // dedup cache for this (client_ip, domain) key.
+        server.maybe_send_svalinn_tunnel_event(Some(addr), &score);
+
+        let dropped_after_first = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            dropped_after_first,
+            dropped_before + 1,
+            "gate-full call must be counted as dropped"
+        );
+        assert!(
+            server
+                .tunnel_svalinn_send_seen
+                .lock()
+                .peek(&(addr.ip(), score.registrable_domain.clone()))
+                .is_none(),
+            "a gate-full drop must NOT mark the (client_ip, domain) pair as \
+             already sent in the dedup cache -- otherwise a future retry for \
+             this exact key would be silently suppressed forever, even after \
+             concurrency capacity frees up"
+        );
+
+        // Free exactly one permit and retry with the SAME key: must now
+        // succeed (consume the freed permit), proving the earlier gate-full
+        // drop did not poison the dedup cache for this key.
+        held_permits.pop();
+        assert_eq!(server.svalinn_inflight.available_permits(), 1);
+
+        server.maybe_send_svalinn_tunnel_event(Some(addr), &score);
+        assert_eq!(
+            server.svalinn_inflight.available_permits(),
+            0,
+            "retry with the same (client_ip, domain) key after capacity \
+             freed up must succeed and consume the freed permit -- if this \
+             is still 1, the earlier gate-full drop silently poisoned the \
+             dedup cache for this key, reintroducing the round-3-class \
+             ordering bug for the tunnel path"
+        );
+
+        drop(held_permits);
     }
 }

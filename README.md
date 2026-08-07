@@ -30,6 +30,7 @@ directional, not a guarantee.*
 - 🔒 **Bloom Filter** - O(1) blocklist lookup
 - 🔗 **Threat-Feed Integration** - Real-time threat sync with a compatible WAF/shield backend (e.g. [Tameng](https://github.com/koodoxz/tameng))
 - 🧬 **DGA Detection** - Heuristic scoring for algorithmically-generated domains, alert-only, disabled by default
+- 🕳️ **DNS-Tunneling Detection** - Flags domains with an unusually high distinct-subdomain query rate, alert-only, disabled by default
 - 📊 **Prometheus Metrics** - Full observability
 
 ## Quick Start
@@ -84,6 +85,16 @@ svalinn:
 dga:
   enabled: false
   threshold: 0.5
+
+# DNS-tunneling heuristic detection -- alert-only. Flags a registrable
+# domain once it has generated more than distinct_subdomain_threshold
+# distinct subdomains within the tracker's retention window (bounded by
+# the two capacity settings below), never blocks a query.
+tunnel:
+  enabled: false
+  distinct_subdomain_threshold: 30
+  tracker_outer_capacity: 2000
+  tracker_inner_capacity: 256
 
 metrics:
   enabled: true

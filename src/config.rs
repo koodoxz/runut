@@ -41,6 +41,11 @@ pub struct Config {
     /// SVALINN integration
     #[serde(default)]
     pub svalinn: SvalinnConfig,
+
+    /// DNS-tunneling heuristic detection -- alert-only, no block capability.
+    /// MIMIR-DNS-TUNNEL-DETECT-001.
+    #[serde(default)]
+    pub tunnel: TunnelConfig,
     
     /// Metrics configuration
     #[serde(default)]
@@ -277,6 +282,79 @@ impl Default for DgaConfig {
 
 fn default_dga_threshold() -> f64 { 0.5 }
 
+/// DNS-tunneling heuristic detection configuration
+/// (MIMIR-DNS-TUNNEL-DETECT-001). Ships disabled by default, same rationale
+/// as `DgaConfig` above -- a new detector on a live production resolver
+/// should be an explicit opt-in. Alert-only; has no block/deny capability in
+/// this REQ. See src/tunnel.rs for the distinct-subdomain-per-domain design
+/// this configures.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TunnelConfig {
+    /// Enable DNS-tunneling detection logging.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Distinct-subdomain-chain count seen for one registrable domain
+    /// (bounded by `tracker_inner_capacity`'s fixed-capacity retention, not
+    /// a time window) above which a domain is flagged as tunnel-suspected.
+    /// See src/tunnel.rs's module doc comment for why distinct-subdomain
+    /// count, not per-query entropy, is this detector's primary signal.
+    #[serde(default = "default_tunnel_threshold")]
+    pub distinct_subdomain_threshold: u32,
+
+    /// Maximum number of distinct registrable domains tracked concurrently
+    /// (outer LRU capacity in `tunnel::TunnelTracker`). Primarily a memory
+    /// bound, but NOT merely a memory bound with no detection-accuracy
+    /// cost: on a resolver seeing more than this many distinct active
+    /// registrable domains at once (routine at scale), a low-and-slow
+    /// tunneling domain can be evicted from the outer LRU by unrelated
+    /// background traffic between its own queries, silently resetting its
+    /// distinct-subdomain count back to zero -- a real detection gap for
+    /// patient/slow tunneling, not just a memory tradeoff (found in
+    /// review). A time-windowed or minimum-retention mechanism could close
+    /// this gap; out of scope for this REQ. Documented plainly rather than
+    /// asserting a stronger guarantee than the code provides, matching
+    /// `tunnel_alert_seen`'s field doc comment in server/mod.rs and
+    /// `TunnelTracker::record`'s own "Accepted imprecision" section.
+    #[serde(default = "default_tunnel_outer_capacity")]
+    pub tracker_outer_capacity: usize,
+
+    /// Maximum number of distinct subdomain-chains tracked per registrable
+    /// domain (inner LRU capacity). Also caps how high `distinct_count` can
+    /// ever read for a given domain -- see `TunnelTracker::record`'s doc
+    /// comment in src/tunnel.rs for the accepted-imprecision tradeoff this
+    /// implies.
+    #[serde(default = "default_tunnel_inner_capacity")]
+    pub tracker_inner_capacity: usize,
+}
+
+impl Default for TunnelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            distinct_subdomain_threshold: default_tunnel_threshold(),
+            tracker_outer_capacity: default_tunnel_outer_capacity(),
+            tracker_inner_capacity: default_tunnel_inner_capacity(),
+        }
+    }
+}
+
+// 30: enough headroom above normal CDN/cloud subdomain churn per domain
+// within the tracker's retention window (bounded by tracker_inner_capacity,
+// not time), while still catching sustained tunneling traffic, which
+// typically generates a new distinct subdomain almost every query. A
+// starting point, not corpus-validated -- same honest caveat as dga.rs's
+// own weight-retune comment on `longest_consonant_run`'s weight.
+fn default_tunnel_threshold() -> u32 { 30 }
+// 2000 distinct registrable domains tracked concurrently, 256 distinct
+// subdomain-chains tracked per domain: both fixed, conservative memory
+// bounds (worst case a few MB of label bytes), not corpus-tuned either --
+// generous enough that legitimate high-fanout deployments (CDN edge nodes,
+// container orchestration) shouldn't routinely evict/plateau under normal
+// traffic, small enough to bound memory under sustained hostile traffic.
+fn default_tunnel_outer_capacity() -> usize { 2000 }
+fn default_tunnel_inner_capacity() -> usize { 256 }
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SvalinnConfig {
     /// Enable SVALINN integration
@@ -376,6 +454,53 @@ impl Config {
                 config.dga.threshold
             );
         }
+        // tunnel.distinct_subdomain_threshold == 0 would fire on the very
+        // first query seen for any domain (distinct_count starts at 1),
+        // which is meaningless as a "sustained tunneling" signal -- fail
+        // loudly at load instead of shipping a detector that alerts on
+        // every domain immediately. Checked regardless of tunnel.enabled,
+        // same as dga.threshold above, so a misconfiguration is caught even
+        // before the operator flips the feature on.
+        if config.tunnel.distinct_subdomain_threshold == 0 {
+            anyhow::bail!(
+                "tunnel.distinct_subdomain_threshold must be > 0, got 0 (a 0 \
+                 threshold fires on the very first query for any domain)"
+            );
+        }
+        // Both LRU capacities feed `NonZeroUsize::new(...)` in
+        // `tunnel::TunnelTracker::new` (see src/tunnel.rs). Validating here,
+        // once, at load time -- rather than re-checking (or panicking) per
+        // query -- means `TunnelTracker::new` can rely on an
+        // already-validated value, the same fail-loudly-at-load rationale
+        // as the dga.threshold/svalinn.url checks in this function.
+        if config.tunnel.tracker_outer_capacity == 0 {
+            anyhow::bail!("tunnel.tracker_outer_capacity must be > 0, got 0");
+        }
+        if config.tunnel.tracker_inner_capacity == 0 {
+            anyhow::bail!("tunnel.tracker_inner_capacity must be > 0, got 0");
+        }
+        // distinct_subdomain_threshold gates on `TunnelTracker::record`'s
+        // return value, which itself can never exceed tracker_inner_capacity
+        // (the inner LRU's own capacity bound -- see its "Accepted
+        // imprecision" doc comment in src/tunnel.rs). A threshold set above
+        // that ceiling means distinct_count can never reach it: the detector
+        // silently never fires, with no error and queries_tunnel_suspected
+        // permanently stuck at 0 (found in review, MEDIUM-1). This is a
+        // realistic operator footgun, not just a theoretical edge case --
+        // raising the threshold to reduce false positives is the natural
+        // response to noisy alerts, and doing so past tracker_inner_capacity
+        // silently kills the detector entirely. Fail loudly at load instead,
+        // same rationale as the checks above.
+        if config.tunnel.distinct_subdomain_threshold as usize > config.tunnel.tracker_inner_capacity {
+            anyhow::bail!(
+                "tunnel.distinct_subdomain_threshold ({}) must not exceed \
+                 tunnel.tracker_inner_capacity ({}): the inner LRU's \
+                 distinct-subdomain count can never exceed its own capacity, \
+                 so a threshold above it means this detector can never fire",
+                config.tunnel.distinct_subdomain_threshold,
+                config.tunnel.tracker_inner_capacity
+            );
+        }
         // svalinn.enabled with a missing/malformed url would silently no-op
         // every DGA event (the client still builds, every send just fails)
         // instead of telling the operator at startup that the integration
@@ -410,7 +535,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_config() {
         // Test recursive mode (default)
@@ -422,7 +547,7 @@ mode: recursive
         assert_eq!(config.cache.size, 50000);
         assert_eq!(config.mode, "recursive");
     }
-    
+
     #[test]
     fn test_forward_config() {
         // Test forward mode with upstream
@@ -436,5 +561,153 @@ upstream:
         assert_eq!(config.mode, "forward");
         assert!(config.upstream.is_some());
         assert_eq!(config.upstream.unwrap().servers[0], "1.1.1.1:53");
+    }
+
+    // ---- Config::load validation ----
+    //
+    // The tests above (`test_default_config`/`test_forward_config`) call
+    // `serde_yaml::from_str` directly, bypassing `Config::load` entirely --
+    // which means none of the six `bail!` validation arms in `load` (the
+    // dga.threshold range check, the four tunnel.* checks including the
+    // MEDIUM-1 fix added this session, and the svalinn.url check) were ever
+    // exercised by CI, despite each having a detailed doc comment justifying
+    // why it exists. Found in review (round 2 of the tunnel-detection Opus
+    // judge chain, MEDIUM): a future refactor could silently weaken or drop
+    // any of these checks (e.g. `>` -> `>=`) with green CI. `Config::load`
+    // reads from a real file path, so these tests write a real temp YAML
+    // file (std-only, no new dev-dependency -- `tempfile` isn't already a
+    // dependency and isn't needed for this) rather than testing the
+    // in-memory struct alone, so they exercise the exact code path a
+    // misconfigured deployment would hit.
+    //
+    // Filenames are made unique per test (PID + an atomic counter) because
+    // `cargo test` runs tests in parallel by default within one process.
+    fn write_temp_config(yaml: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mimir-config-load-test-{}-{}.yaml",
+            std::process::id(),
+            n
+        ));
+        std::fs::write(&path, yaml).expect("write temp config file");
+        path
+    }
+
+    /// Guarantees the temp file is removed even if an assertion in the test
+    /// body panics, so a failing test doesn't leak files into the OS temp
+    /// directory across repeated runs.
+    struct TempConfigFile(std::path::PathBuf);
+    impl Drop for TempConfigFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn config_load_accepts_fully_default_config() {
+        let path = write_temp_config("mode: recursive\n");
+        let _guard = TempConfigFile(path.clone());
+        let result = Config::load(&path);
+        assert!(result.is_ok(), "default config must load cleanly: {:?}", result.err());
+    }
+
+    #[test]
+    fn config_load_rejects_dga_threshold_above_one() {
+        let path = write_temp_config("mode: recursive\ndga:\n  threshold: 1.5\n");
+        let _guard = TempConfigFile(path.clone());
+        let err = Config::load(&path).expect_err("threshold > 1.0 must be rejected");
+        assert!(err.to_string().contains("dga.threshold"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn config_load_rejects_dga_threshold_nan() {
+        let path = write_temp_config("mode: recursive\ndga:\n  threshold: .nan\n");
+        let _guard = TempConfigFile(path.clone());
+        let err = Config::load(&path).expect_err("NaN threshold must be rejected, not silently pass the >= comparison");
+        assert!(err.to_string().contains("dga.threshold"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn config_load_rejects_zero_tunnel_distinct_subdomain_threshold() {
+        let path = write_temp_config("mode: recursive\ntunnel:\n  distinct_subdomain_threshold: 0\n");
+        let _guard = TempConfigFile(path.clone());
+        let err = Config::load(&path).expect_err("threshold=0 must be rejected");
+        assert!(
+            err.to_string().contains("tunnel.distinct_subdomain_threshold"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_zero_tunnel_tracker_outer_capacity() {
+        let path = write_temp_config("mode: recursive\ntunnel:\n  tracker_outer_capacity: 0\n");
+        let _guard = TempConfigFile(path.clone());
+        let err = Config::load(&path).expect_err("tracker_outer_capacity=0 must be rejected");
+        assert!(
+            err.to_string().contains("tunnel.tracker_outer_capacity"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_zero_tunnel_tracker_inner_capacity() {
+        let path = write_temp_config("mode: recursive\ntunnel:\n  tracker_inner_capacity: 0\n");
+        let _guard = TempConfigFile(path.clone());
+        let err = Config::load(&path).expect_err("tracker_inner_capacity=0 must be rejected");
+        assert!(
+            err.to_string().contains("tunnel.tracker_inner_capacity"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_load_rejects_threshold_exceeding_inner_capacity() {
+        // The MEDIUM-1 fix's exact boundary: 257 > 256 must fail.
+        let path = write_temp_config(
+            "mode: recursive\ntunnel:\n  distinct_subdomain_threshold: 257\n  tracker_inner_capacity: 256\n",
+        );
+        let _guard = TempConfigFile(path.clone());
+        let err = Config::load(&path).expect_err("threshold exceeding inner_capacity must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("distinct_subdomain_threshold") && msg.contains("tracker_inner_capacity"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn config_load_accepts_threshold_equal_to_inner_capacity() {
+        // The MEDIUM-1 fix's exact boundary, other side: 256 == 256 must
+        // pass (`>`, not `>=` -- a threshold exactly at the inner LRU's
+        // capacity IS reachable, since `record`'s count can legitimately
+        // reach `inner_capacity` itself).
+        let path = write_temp_config(
+            "mode: recursive\ntunnel:\n  distinct_subdomain_threshold: 256\n  tracker_inner_capacity: 256\n",
+        );
+        let _guard = TempConfigFile(path.clone());
+        let result = Config::load(&path);
+        assert!(result.is_ok(), "threshold == inner_capacity must be accepted: {:?}", result.err());
+    }
+
+    #[test]
+    fn config_load_rejects_malformed_svalinn_url_when_enabled() {
+        let path = write_temp_config(
+            "mode: recursive\nsvalinn:\n  enabled: true\n  url: \"not a url\"\n",
+        );
+        let _guard = TempConfigFile(path.clone());
+        let err = Config::load(&path).expect_err("malformed svalinn.url with svalinn.enabled=true must be rejected");
+        assert!(err.to_string().contains("svalinn.url"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn config_load_ignores_malformed_svalinn_url_when_disabled() {
+        // svalinn.enabled defaults to false -- a malformed url must NOT
+        // block startup when the integration itself is off.
+        let path = write_temp_config("mode: recursive\nsvalinn:\n  url: \"not a url\"\n");
+        let _guard = TempConfigFile(path.clone());
+        let result = Config::load(&path);
+        assert!(result.is_ok(), "malformed url must be ignored when svalinn.enabled=false: {:?}", result.err());
     }
 }
