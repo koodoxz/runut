@@ -291,7 +291,13 @@ pub struct SvalinnConfig {
     #[serde(default)]
     pub api_key: String,
     
-    /// Sync interval in seconds
+    /// Sync interval in seconds.
+    // ponytail: parsed but never read anywhere -- no periodic sync/health-
+    // check job consumes it yet. Left as a config field (not removed) since
+    // it's user-facing YAML surface that may already be set in deployed
+    // configs; wiring it to an actual periodic job is a separate REQ, not
+    // bundled into the DGA-event-forwarding feature this struct was
+    // extended for. Not an oversight -- documented dead field.
     #[serde(default = "default_sync")]
     pub sync_interval_secs: u64,
 }
@@ -369,6 +375,22 @@ impl Config {
                 "dga.threshold must be in [0.0, 1.0], got {}",
                 config.dga.threshold
             );
+        }
+        // svalinn.enabled with a missing/malformed url would silently no-op
+        // every DGA event (the client still builds, every send just fails)
+        // instead of telling the operator at startup that the integration
+        // they turned on cannot actually reach anywhere -- same
+        // fail-loudly-at-load rationale as the dga.threshold check above.
+        if config.svalinn.enabled {
+            let url_is_valid = reqwest::Url::parse(&config.svalinn.url)
+                .map(|u| u.scheme() == "http" || u.scheme() == "https")
+                .unwrap_or(false);
+            if !url_is_valid {
+                anyhow::bail!(
+                    "svalinn.url must be a well-formed http(s):// URL when svalinn.enabled is true, got {:?}",
+                    config.svalinn.url
+                );
+            }
         }
         Ok(config)
     }

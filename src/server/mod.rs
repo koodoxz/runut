@@ -8,7 +8,7 @@ pub mod doq;  // DNS-over-QUIC
 
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +22,7 @@ use crate::dga;
 use crate::filter::BlockFilter;
 use crate::forwarder::DnsForwarder;
 use crate::resolver::{Resolver, ResolverConfig};
+use crate::svalinn::{self, DnsEvent};
 use crate::xdp::XdpSyncClient;
 
 /// Resolution backend
@@ -47,7 +48,52 @@ pub struct DnsServer {
     // capacity, not time-windowed: an evicted-then-reseen label just
     // re-alerts, an accepted imprecision favoring a hard memory bound.
     dga_alert_seen: parking_lot::Mutex<lru::LruCache<String, ()>>,
+    // Shared reqwest client for SVALINN DGA-event forwarding, built once
+    // (not per-query) so TCP connections/TLS sessions to SVALINN are
+    // pooled and reused. `None` when svalinn.enabled is false -- zero
+    // client/connection-pool resources held in that (default) state, not
+    // just zero requests sent. See `maybe_send_svalinn_dga_event`.
+    svalinn_client: Option<reqwest::Client>,
+    // Rate-limits how often a SVALINN POST-failure is logged, independent
+    // of `dga_alert_seen`'s per-domain dedup -- see svalinn.rs's doc
+    // comment on `should_log_svalinn_failure` for why both are needed.
+    svalinn_failure_gate: Arc<std::sync::atomic::AtomicU64>,
+    // Bounds concurrent outbound SVALINN POSTs. `dga_alert_seen` above only
+    // suppresses *repeats of the same label*; a DGA-infected host querying
+    // many *distinct* C2 domains (exactly the traffic this feature exists
+    // to catch) would otherwise spawn one uncapped HTTP task per domain --
+    // if the receiver is slow, concurrency can spike into the thousands and
+    // exhaust file descriptors, which permanently kills this resolver's own
+    // `listener.accept().await?` loops (found in review, HIGH-1). Acquired
+    // with a non-blocking `try_acquire_owned()` in
+    // `maybe_send_svalinn_dga_event` -- a full gate drops the event rather
+    // than queuing or blocking.
+    svalinn_inflight: Arc<tokio::sync::Semaphore>,
+    // Second, narrower dedup than `dga_alert_seen`: gates whether a SVALINN
+    // *send* happens, keyed on (client_ip, label) rather than label alone.
+    // `dga_alert_seen` is intentionally left as label-only (it controls
+    // local log-volume for the `warn!` line and must stay that way) -- but
+    // reusing it to gate the SVALINN send meant only the first client IP
+    // ever seen querying a given DGA domain was ever reported, making every
+    // later infected host invisible to SVALINN's actor tracking (found in
+    // review, MEDIUM-1). This cache exists solely to fix that.
+    svalinn_send_seen: parking_lot::Mutex<lru::LruCache<(IpAddr, String), ()>>,
 }
+
+/// Maximum number of concurrent outbound SVALINN DGA-event POSTs. Chosen as
+/// a small, fixed bound well below typical fd-limit headroom on this
+/// latency-critical resolver -- large enough that legitimate DGA-alert
+/// bursts aren't routinely dropped, small enough that even a fully-hung
+/// SVALINN receiver can never come close to fd exhaustion. See
+/// `svalinn_inflight`'s field doc comment (HIGH-1).
+const SVALINN_MAX_INFLIGHT: usize = 32;
+
+/// Capacity of `svalinn_send_seen`, the (client_ip, label) dedup cache that
+/// gates SVALINN sends (MEDIUM-1). Same order of magnitude as
+/// `dga_alert_seen`'s 10_000 -- a fixed memory bound, not time-windowed: an
+/// evicted-then-reseen (client_ip, label) pair just gets re-sent, an
+/// accepted imprecision favoring a hard memory bound over unbounded growth.
+const SVALINN_SEND_DEDUP_CAPACITY: usize = 10_000;
 
 /// Server statistics
 pub struct ServerStats {
@@ -57,6 +103,21 @@ pub struct ServerStats {
     pub queries_forwarded: std::sync::atomic::AtomicU64,
     pub queries_failed: std::sync::atomic::AtomicU64,
     pub queries_dga_suspected: std::sync::atomic::AtomicU64,
+    // Count of DGA events that were NOT sent to SVALINN because the
+    // concurrency gate (`svalinn_inflight`, HIGH-1) was full at the moment
+    // of decision -- distinct from a send that was attempted and failed
+    // (those go through `should_log_svalinn_failure` instead). Exists so
+    // these silent drops are observable rather than invisible.
+    pub svalinn_events_dropped: std::sync::atomic::AtomicU64,
+    // Count of DGA events that were never even attempted because
+    // `svalinn::build_alert_domain` returned `None` -- i.e. at least one
+    // wire label in the query was not valid UTF-8 (see that function's
+    // doc comment). This is a distinct, silent skip path from
+    // `svalinn_events_dropped` above (gate-full) and previously had zero
+    // observability: no counter, no log line, unlike the other two skip
+    // paths in `maybe_send_svalinn_dga_event` (found in round-3 review,
+    // NEW-1).
+    pub svalinn_events_skipped_invalid_utf8: std::sync::atomic::AtomicU64,
     // Latency buckets for histogram (in microseconds): [0-1ms, 1-5ms, 5-10ms, 10-50ms, 50-100ms, 100ms+]
     pub latency_bucket_0_1ms: std::sync::atomic::AtomicU64,
     pub latency_bucket_1_5ms: std::sync::atomic::AtomicU64,
@@ -76,6 +137,8 @@ impl ServerStats {
             queries_forwarded: std::sync::atomic::AtomicU64::new(0),
             queries_failed: std::sync::atomic::AtomicU64::new(0),
             queries_dga_suspected: std::sync::atomic::AtomicU64::new(0),
+            svalinn_events_dropped: std::sync::atomic::AtomicU64::new(0),
+            svalinn_events_skipped_invalid_utf8: std::sync::atomic::AtomicU64::new(0),
             latency_bucket_0_1ms: std::sync::atomic::AtomicU64::new(0),
             latency_bucket_1_5ms: std::sync::atomic::AtomicU64::new(0),
             latency_bucket_5_10ms: std::sync::atomic::AtomicU64::new(0),
@@ -109,7 +172,15 @@ impl ServerStats {
     pub fn inc_dga_suspected(&self) {
         self.queries_dga_suspected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    
+
+    pub fn inc_svalinn_events_dropped(&self) {
+        self.svalinn_events_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn inc_svalinn_events_skipped_invalid_utf8(&self) {
+        self.svalinn_events_skipped_invalid_utf8.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn record_latency_micros(&self, micros: u64) {
         // Increment appropriate bucket
         if micros < 1000 {  // < 1ms
@@ -189,7 +260,38 @@ impl DnsServer {
         if xdp_sync.is_some() {
             info!("XDP acceleration enabled (local sync on 127.0.0.1:9154)");
         }
-        
+
+        // Built once here, not per-query -- reused via Clone (reqwest::Client
+        // is internally Arc'd, so cloning is cheap) from the DGA alert path
+        // in handle_query_internal. None when disabled: no connection pool,
+        // no idle sockets held, matching dga.enabled's own zero-overhead
+        // opt-in pattern. Short timeout so any single in-flight request
+        // can't hang indefinitely -- this bounds per-request *duration*
+        // only, NOT how many requests can be in flight at once; that's a
+        // separate concern handled by `svalinn_inflight` below (found in
+        // review, HIGH-1: the two are not substitutes for each other).
+        let svalinn_client = if config.svalinn.enabled {
+            match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .build()
+            {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    warn!("Failed to build SVALINN HTTP client, DGA event forwarding disabled: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if config.svalinn.enabled {
+            info!("SVALINN DGA event forwarding: enabled (target: {})", config.svalinn.url);
+        } else {
+            info!("SVALINN DGA event forwarding: disabled");
+        }
+
         Ok(Self {
             config,
             cache,
@@ -199,6 +301,12 @@ impl DnsServer {
             xdp_sync,
             dga_alert_seen: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(10_000).unwrap(),
+            )),
+            svalinn_client,
+            svalinn_failure_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            svalinn_inflight: Arc::new(tokio::sync::Semaphore::new(SVALINN_MAX_INFLIGHT)),
+            svalinn_send_seen: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(SVALINN_SEND_DEDUP_CAPACITY).unwrap(),
             )),
         })
     }
@@ -272,7 +380,7 @@ impl DnsServer {
                             let socket = socket.clone();
                             
                             tokio::spawn(async move {
-                                match server.handle_query(query).await {
+                                match server.handle_query(query, Some(src)).await {
                                     Ok(response) => {
                                         if let Err(e) = socket.send_to(&response, src).await {
                                             debug!("Send error to {}: {}", src, e);
@@ -331,7 +439,7 @@ impl DnsServer {
                     let socket = socket.clone();
                     
                     tokio::spawn(async move {
-                        match server.handle_query(query).await {
+                        match server.handle_query(query, Some(src)).await {
                             Ok(response) => {
                                 if let Err(e) = socket.send_to(&response, src).await {
                                     debug!("Send error to {}: {}", src, e);
@@ -373,7 +481,7 @@ impl DnsServer {
                     return;
                 }
                 
-                match server.handle_query(Bytes::from(buf)).await {
+                match server.handle_query(Bytes::from(buf), Some(src)).await {
                     Ok(response) => {
                         // Write length prefix + response
                         let len = (response.len() as u16).to_be_bytes();
@@ -388,13 +496,20 @@ impl DnsServer {
         }
     }
     
-    /// Handle DNS query
-    async fn handle_query(&self, query: Bytes) -> Result<Bytes> {
+    /// Handle DNS query.
+    ///
+    /// `client_addr` is the real source address of the query, when the
+    /// calling protocol path has one available (UDP/TCP/DoT/DoH/DoQ all do
+    /// -- see each `run_*`/`handle_*_request` call site). It is currently
+    /// used only to populate `client_ip` on outbound SVALINN DGA events;
+    /// `None` here means "not sent", never a fabricated address (see
+    /// `maybe_send_svalinn_dga_event`).
+    async fn handle_query(&self, query: Bytes, client_addr: Option<SocketAddr>) -> Result<Bytes> {
         let start = std::time::Instant::now();
         self.stats.inc_total();
         let raw_query = query.clone();
-        
-        let result = match self.handle_query_internal(query).await {
+
+        let result = match self.handle_query_internal(query, client_addr).await {
             Ok(response) => Ok(response),
             Err(e) => {
                 self.stats.inc_failed();
@@ -415,8 +530,8 @@ impl DnsServer {
         result
     }
 
-    async fn handle_query_internal(&self, query: Bytes) -> Result<Bytes> {
-        
+    async fn handle_query_internal(&self, query: Bytes, client_addr: Option<SocketAddr>) -> Result<Bytes> {
+
         // Parse query
         let message = Message::from_bytes(&query)?;
         let id = message.id();
@@ -458,7 +573,18 @@ impl DnsServer {
                     //
                     // Dedup on the scored label before logging -- an attacker
                     // repeating the same high-scoring name can otherwise flood
-                    // the log/disk at query rate (found in review).
+                    // the log/disk at query rate (found in review). This
+                    // gate controls ONLY the local `warn!` line's volume
+                    // (label-only, no client_ip). It must NOT also gate
+                    // whether SVALINN gets notified below -- nesting the
+                    // send call inside this `if` was a real bug (round-3
+                    // fix): it meant a second, third, ... Nth distinct
+                    // client IP querying a label some earlier client already
+                    // triggered this `warn!` for would never even reach
+                    // `maybe_send_svalinn_dga_event`, making that method's
+                    // own (client_ip, label) dedup (`svalinn_send_seen`)
+                    // unreachable in production for every client after the
+                    // first.
                     let already_seen = self
                         .dga_alert_seen
                         .lock()
@@ -469,6 +595,81 @@ impl DnsServer {
                             "DGA suspected: {:?} label={:?} score={:.2} reasons={:?}",
                             query_name, dga_score.label, dga_score.score, dga_score.reasons
                         );
+                    }
+
+                    // Forward to SVALINN unconditionally -- i.e. regardless
+                    // of `already_seen` above -- gated ONLY by
+                    // `maybe_send_svalinn_dga_event`'s own internal
+                    // (client_ip, label) dedup (`svalinn_send_seen`, see its
+                    // field doc comment, MEDIUM-1). This call must NOT live
+                    // inside the `if !already_seen` block above; see the
+                    // comment on `already_seen` for the bug that shape
+                    // caused (round-3 fix). The local `warn!` above and this
+                    // send are now genuinely independent: this runs whether
+                    // or not that log fired. Spawned, never awaited inline,
+                    // so a slow/unreachable SVALINN instance can never delay
+                    // DNS resolution.
+                    //
+                    // Gate on `svalinn_client.is_some()` BEFORE ever calling
+                    // `build_alert_domain` below (round-4 fix, NEW-3):
+                    // `build_alert_domain` allocates a `Vec` + per-label
+                    // `String`s and does a join, so calling it unconditionally
+                    // meant that allocation ran on every above-threshold DGA
+                    // query even when SVALINN is disabled (the default) --
+                    // directly contradicting `maybe_send_svalinn_dga_event`'s
+                    // own doc comment, which promises "zero overhead in the
+                    // default-disabled state". This check is just an `Option`
+                    // read on `self`, so it is genuinely free. The function's
+                    // own internal `svalinn_client.is_none()` check remains in
+                    // place as defense-in-depth for any future call site that
+                    // doesn't gate here first.
+                    if self.svalinn_client.is_some() {
+                        // Domain string built from the same raw wire-format
+                        // label bytes the DGA scorer used (query_labels), NOT
+                        // query_name's Display string -- see dga.rs's module doc
+                        // comment for why (trust-dns IDNA-decodes/unescapes
+                        // labels in the display form, which silently breaks
+                        // correlation against other IOC feeds using the
+                        // canonical ASCII/punycode form). Built via
+                        // `svalinn::build_alert_domain`, NOT
+                        // `String::from_utf8_lossy` per label -- lossy decoding
+                        // here reintroduced the exact score-manufacturing class
+                        // dga.rs's own doc comment rejects, and a naive
+                        // '.'-join could desync on a literal '.' byte legally
+                        // inside one wire label the same way dga.rs has a
+                        // dedicated regression test against (round-3 fix; see
+                        // `build_alert_domain`'s doc comment for both). `None`
+                        // (non-UTF-8 label content anywhere in the domain) means
+                        // skip sending this event rather than send a corrupted
+                        // string.
+                        match svalinn::build_alert_domain(&query_labels) {
+                            Some(escaped_domain) => {
+                                self.maybe_send_svalinn_dga_event(client_addr, &escaped_domain, &dga_score);
+                            }
+                            None => {
+                                // Round-4 fix (NEW-1): this skip path
+                                // previously had zero observability -- no
+                                // counter, no log line -- unlike the other
+                                // two skip paths inside
+                                // `maybe_send_svalinn_dga_event` (disabled
+                                // client, gate-full), both of which already
+                                // had one. `debug!`, not `warn!`/`info!`:
+                                // this is attacker-triggerable at query rate
+                                // (any query with a non-UTF-8 label that
+                                // also scores above the DGA threshold), so
+                                // keep it low-severity/low-volume by design,
+                                // matching this codebase's established
+                                // caution about log-flood vectors elsewhere
+                                // in this same file.
+                                self.stats.inc_svalinn_events_skipped_invalid_utf8();
+                                debug!(
+                                    "Skipping SVALINN DGA event: query contains \
+                                     a non-UTF-8 wire label, cannot build a safe \
+                                     domain string (label={:?})",
+                                    dga_score.label
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -547,7 +748,200 @@ impl DnsServer {
         
         Ok(response)
     }
-    
+
+    /// Fire-and-forget forward of a DGA alert to SVALINN as a `DnsEvent`
+    /// POST to `{svalinn.url}/api/v1/dns-events` (see svalinn.rs's doc
+    /// comment for the exact receiver contract this targets:
+    /// github.com/aegis/svalinn, internal/server/handlers.go:2019).
+    ///
+    /// Non-blocking by construction: this method itself never `.await`s --
+    /// it only decides whether to spawn, then spawns. DNS resolution is
+    /// never delayed by this call regardless of SVALINN's latency or
+    /// reachability.
+    ///
+    /// No-op (not even a spawned task) when `svalinn_client` is `None`
+    /// (i.e. `svalinn.enabled` was false at startup) -- zero overhead in
+    /// the default-disabled state, matching `dga.enabled`'s own pattern.
+    /// This function's own check is the last line of defense for that
+    /// guarantee, not the only one: as of round-4, `handle_query_internal`
+    /// (this method's sole call site) also checks `svalinn_client.is_some()`
+    /// itself BEFORE ever calling `svalinn::build_alert_domain` to build the
+    /// `domain` argument passed in here -- that function allocates, so
+    /// gating it at the call site (not just here) is what makes "zero
+    /// overhead when disabled" actually true rather than just documented.
+    ///
+    /// The `let Some(client) = self.svalinn_client.clone() else { return }`
+    /// check immediately below is not dead code left over from that
+    /// reordering; keep it -- it is what protects any future call site that
+    /// forgets to gate before calling `svalinn::build_alert_domain` itself.
+    ///
+    /// `client_ip` is REQUIRED by the receiver (400 if empty). If
+    /// `client_addr` is `None` -- meaning this call site's protocol path
+    /// genuinely has no real client address available -- this method skips
+    /// sending rather than fabricating a placeholder IP (e.g. "0.0.0.0"),
+    /// which would corrupt SVALINN's actor-tracking data on the receiving
+    /// end. As of this change, every protocol path (UDP, TCP, DoT, DoH,
+    /// DoQ) threads a real client address through, so this branch should
+    /// not currently trigger in practice; it remains as a safety net for
+    /// any future call site that doesn't.
+    ///
+    /// Two additional gates run before anything is spawned (both silent
+    /// no-ops on their "skip" path, neither ever blocks): the
+    /// `svalinn_inflight` concurrency gate FIRST (see its field doc comment
+    /// and `SVALINN_MAX_INFLIGHT`, HIGH-1), then the `svalinn_send_seen`
+    /// (client_ip, label) dedup (see its field doc comment, MEDIUM-1). This
+    /// order is deliberate (round-3 fix): the dedup LRU is only marked
+    /// "sent" once a permit is actually held, so a gate-full drop never
+    /// poisons the dedup LRU with a send that didn't happen -- see the
+    /// comment inside the function body for the concrete bug this fixes.
+    /// Only an event that clears both actually spawns a task and consumes
+    /// a permit for that task's lifetime.
+    fn maybe_send_svalinn_dga_event(
+        &self,
+        client_addr: Option<SocketAddr>,
+        domain: &str,
+        dga_score: &dga::DgaScore,
+    ) {
+        let Some(client) = self.svalinn_client.clone() else {
+            return;
+        };
+        let Some(addr) = client_addr else {
+            debug!(
+                "Skipping SVALINN DGA event: no real client address available \
+                 at this protocol path (would otherwise require sending a \
+                 fabricated client_ip, which SVALINN requires and uses for \
+                 actor tracking)"
+            );
+            return;
+        };
+
+        // Non-blocking concurrency gate, checked FIRST -- before the
+        // (client_ip, label) dedup LRU below. Ordering matters (round-3
+        // fix): marking the dedup LRU as "sent" BEFORE checking this gate
+        // was a real bug -- if the gate was full, the event was dropped
+        // AND permanently marked as already-sent in the LRU, so it would
+        // never be retried even after capacity freed up, silently losing
+        // events during exactly the burst conditions this gate exists to
+        // survive. Checking the gate first, and only marking the dedup LRU
+        // once a permit is actually held (below), means a gate-full drop
+        // leaves no trace in the dedup LRU, so a future retry for the same
+        // (client_ip, label) pair remains possible.
+        //
+        // A DGA-infected host querying many *distinct* C2 domains would
+        // otherwise spawn one uncapped HTTP task per domain, and a
+        // slow/hung SVALINN receiver could let that spike into the
+        // thousands, risking fd exhaustion (which permanently kills this
+        // resolver's own accept loops). If the gate is full, drop the
+        // event without even spawning a task -- don't pay for it (found in
+        // review, HIGH-1).
+        let Ok(permit) = self.svalinn_inflight.clone().try_acquire_owned() else {
+            self.stats.inc_svalinn_events_dropped();
+            debug!(
+                "Dropping SVALINN DGA event: {} concurrent forwards already \
+                 in flight (gate full)",
+                SVALINN_MAX_INFLIGHT
+            );
+            return;
+        };
+
+        // Send-decision dedup keyed on (client_ip, label) -- independent of
+        // `dga_alert_seen`'s label-only dedup, which gates only the local
+        // `warn!` line in `handle_query_internal` and is never consulted
+        // here; this method is reached regardless of whether that local
+        // log fired for this label (round-3 fix -- see the call site's
+        // comment). Without this dedup, only the first client IP ever seen
+        // querying a given DGA domain would ever get reported to SVALINN;
+        // every later infected host querying the same domain would be
+        // invisible to SVALINN's actor tracking (found in review,
+        // MEDIUM-1).
+        //
+        // `put` doubles as an atomic check-and-set under a single lock
+        // hold, and only runs now that a permit is held (see the gate
+        // comment above) -- an already-sent pair returns here and drops
+        // the just-acquired `permit`, releasing it back to the semaphore
+        // immediately rather than ever spawning.
+        // ponytail: round-3's dedup-ordering fix (see the block comment
+        // above) moved this `.lock()` to run on every query that reaches
+        // this point when SVALINN is enabled, not just once per distinct
+        // label as before -- i.e. this is now on the per-query hot path,
+        // not the per-distinct-label path. NEW-2 (round-3 review): this
+        // mutex's contention under sustained high-QPS DGA traffic has not
+        // been benchmarked. Accepted as-is for this round (explicit user
+        // decision, not a fix); benchmark before enabling `svalinn` in a
+        // high-QPS production deployment.
+        let send_key = (addr.ip(), dga_score.label.clone());
+        let already_sent_for_client = self
+            .svalinn_send_seen
+            .lock()
+            .put(send_key, ())
+            .is_some();
+        if already_sent_for_client {
+            return;
+        }
+
+        let url = svalinn::build_dns_events_url(&self.config.svalinn.url);
+        // api_key may be empty (unset) -- still sent as a header either way
+        // for forward-compatibility. The receiver does not validate it
+        // today (IP-allowlist only), so an empty/placeholder value here is
+        // not a security gap introduced by this change.
+        let api_key = self.config.svalinn.api_key.clone();
+        let failure_gate = self.svalinn_failure_gate.clone();
+
+        let event = DnsEvent {
+            event_type: "dga".to_string(),
+            client_ip: addr.ip().to_string(),
+            domain: domain.to_string(),
+            score: dga_score.score,
+            reason: dga_score.reasons.join(","),
+            actor_id: None,
+            timestamp: None,
+            source: Some("mimir".to_string()),
+        };
+
+        tokio::spawn(async move {
+            // `permit` is moved in here and dropped (releasing the gate)
+            // when this task ends, on every path -- success, rejection, or
+            // send failure alike.
+            let _permit = permit;
+            // ponytail: Authorization: Bearer is forward-compatible only --
+            // the live receiver checks IP-allowlist before this handler
+            // even runs and does not validate this header today. Not a
+            // real security boundary yet; do not rely on it as one.
+            let result = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&event)
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    debug!("SVALINN DGA event delivered: status={}", resp.status());
+                }
+                Ok(resp) => {
+                    if svalinn::should_log_svalinn_failure(&failure_gate) {
+                        warn!(
+                            "SVALINN DGA event rejected: status={} (further \
+                             failures suppressed briefly to avoid log flood \
+                             during an extended SVALINN outage)",
+                            resp.status()
+                        );
+                    }
+                }
+                Err(e) => {
+                    if svalinn::should_log_svalinn_failure(&failure_gate) {
+                        warn!(
+                            "SVALINN DGA event send failed: {} (further \
+                             failures suppressed briefly to avoid log flood \
+                             during an extended SVALINN outage)",
+                            e
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     fn build_servfail(&self, query: &Message) -> Result<Bytes> {
         let mut response = query.clone();
         response.set_message_type(MessageType::Response);
@@ -610,6 +1004,12 @@ impl DnsServer {
                              # HELP mimir_queries_dga_suspected Queries whose domain scored above the DGA suspicion threshold\n\
                              # TYPE mimir_queries_dga_suspected counter\n\
                              mimir_queries_dga_suspected {}\n\
+                             # HELP mimir_svalinn_events_dropped DGA events dropped without sending because the SVALINN concurrency gate was full\n\
+                             # TYPE mimir_svalinn_events_dropped counter\n\
+                             mimir_svalinn_events_dropped {}\n\
+                             # HELP mimir_svalinn_events_skipped_invalid_utf8 DGA events never attempted because a wire label was not valid UTF-8\n\
+                             # TYPE mimir_svalinn_events_skipped_invalid_utf8 counter\n\
+                             mimir_svalinn_events_skipped_invalid_utf8 {}\n\
                              # HELP mimir_cache_hit_rate Cache hit rate percentage\n\
                              # TYPE mimir_cache_hit_rate gauge\n\
                              mimir_cache_hit_rate {}\n\
@@ -629,6 +1029,8 @@ impl DnsServer {
                             forwarded,
                             stats.queries_failed.load(std::sync::atomic::Ordering::Relaxed),
                             stats.queries_dga_suspected.load(std::sync::atomic::Ordering::Relaxed),
+                            stats.svalinn_events_dropped.load(std::sync::atomic::Ordering::Relaxed),
+                            stats.svalinn_events_skipped_invalid_utf8.load(std::sync::atomic::Ordering::Relaxed),
                             cache_hit_rate,
                             // Histogram buckets (cumulative)
                             stats.latency_bucket_0_1ms.load(std::sync::atomic::Ordering::Relaxed),
@@ -662,5 +1064,459 @@ impl DnsServer {
                 }
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `svalinn.enabled: false` (the default -- omitted entirely here) must
+    /// mean `DnsServer::new()` genuinely does not build a `reqwest::Client`
+    /// at all, not just "builds one but never uses it". Previously this was
+    /// only asserted in doc comments, never tested (found in review,
+    /// MEDIUM-2).
+    fn disabled_config() -> Config {
+        serde_yaml::from_str("mode: recursive\n").unwrap()
+    }
+
+    /// `svalinn.enabled: true` with a syntactically valid (but unreachable)
+    /// target -- these tests never await the spawned HTTP send, so the
+    /// target does not need to be reachable.
+    fn enabled_config() -> Config {
+        serde_yaml::from_str(
+            "mode: recursive\nsvalinn:\n  enabled: true\n  url: \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap()
+    }
+
+    fn sample_dga_score(label: &str) -> dga::DgaScore {
+        dga::DgaScore {
+            score: 0.9,
+            label: label.to_string(),
+            reasons: vec!["high_entropy"],
+        }
+    }
+
+    #[tokio::test]
+    async fn svalinn_client_is_none_when_disabled() {
+        let server = DnsServer::new(disabled_config()).await.unwrap();
+        assert!(
+            server.svalinn_client.is_none(),
+            "svalinn_client must not be built when svalinn.enabled is false"
+        );
+    }
+
+    #[tokio::test]
+    async fn svalinn_client_is_some_when_enabled() {
+        let server = DnsServer::new(enabled_config()).await.unwrap();
+        assert!(
+            server.svalinn_client.is_some(),
+            "svalinn_client must be built when svalinn.enabled is true"
+        );
+    }
+
+    /// HIGH-1: with the concurrency gate fully exhausted, the event must be
+    /// dropped (no permit consumed, no spawn) and counted via
+    /// `svalinn_events_dropped`, rather than spawning an unbounded task.
+    #[tokio::test]
+    async fn svalinn_inflight_gate_drops_event_and_counts_it_when_full() {
+        let server = DnsServer::new(enabled_config()).await.unwrap();
+
+        // Pre-acquire every permit so the gate is exhausted before the
+        // function under test ever runs.
+        let mut held_permits = Vec::new();
+        for _ in 0..SVALINN_MAX_INFLIGHT {
+            held_permits.push(
+                server
+                    .svalinn_inflight
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate should not be exhausted yet"),
+            );
+        }
+        assert_eq!(server.svalinn_inflight.available_permits(), 0);
+
+        let addr: SocketAddr = "203.0.113.7:12345".parse().unwrap();
+        let before = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        server.maybe_send_svalinn_dga_event(Some(addr), "evil.example.com", &sample_dga_score("evil"));
+
+        let after = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before + 1, "gate-full event must be counted as dropped");
+        assert_eq!(
+            server.svalinn_inflight.available_permits(),
+            0,
+            "a dropped event must not consume a permit"
+        );
+
+        // Keep the held permits alive for the whole assertion window above.
+        drop(held_permits);
+    }
+
+    /// MEDIUM-1: the (client_ip, label) send-dedup must allow two distinct
+    /// client IPs querying the same DGA label to both be sent, while a
+    /// repeat from the same client IP is suppressed. Observed indirectly via
+    /// the concurrency-gate permit count, since a "sent" event synchronously
+    /// consumes a permit at the point `maybe_send_svalinn_dga_event` returns
+    /// (before the spawned task is ever polled), and a suppressed one does
+    /// not.
+    #[tokio::test]
+    async fn svalinn_send_dedup_keys_on_client_ip_and_label() {
+        let server = DnsServer::new(enabled_config()).await.unwrap();
+        assert_eq!(server.svalinn_inflight.available_permits(), SVALINN_MAX_INFLIGHT);
+
+        let addr_a: SocketAddr = "203.0.113.7:1".parse().unwrap();
+        let addr_b: SocketAddr = "203.0.113.8:1".parse().unwrap();
+        let score = sample_dga_score("evil");
+
+        // First send from client A consumes a permit.
+        server.maybe_send_svalinn_dga_event(Some(addr_a), "evil.example.com", &score);
+        assert_eq!(server.svalinn_inflight.available_permits(), SVALINN_MAX_INFLIGHT - 1);
+
+        // A repeat from the SAME client A + same label must be suppressed
+        // by the (client_ip, label) dedup -- no additional permit consumed.
+        server.maybe_send_svalinn_dga_event(Some(addr_a), "evil.example.com", &score);
+        assert_eq!(server.svalinn_inflight.available_permits(), SVALINN_MAX_INFLIGHT - 1);
+
+        // A DIFFERENT client B querying the same label must still be sent.
+        server.maybe_send_svalinn_dga_event(Some(addr_b), "evil.example.com", &score);
+        assert_eq!(server.svalinn_inflight.available_permits(), SVALINN_MAX_INFLIGHT - 2);
+    }
+
+    /// `client_addr == None` must skip sending entirely -- no client, no
+    /// spawn, no permit consumed (this call site never fabricates a
+    /// placeholder IP).
+    #[tokio::test]
+    async fn svalinn_send_skipped_when_no_client_addr() {
+        let server = DnsServer::new(enabled_config()).await.unwrap();
+        assert_eq!(server.svalinn_inflight.available_permits(), SVALINN_MAX_INFLIGHT);
+
+        server.maybe_send_svalinn_dga_event(None, "evil.example.com", &sample_dga_score("evil"));
+
+        assert_eq!(
+            server.svalinn_inflight.available_permits(),
+            SVALINN_MAX_INFLIGHT,
+            "no client address means no permit should be consumed"
+        );
+    }
+
+    /// `svalinn_client == None` (disabled) must be a true no-op: no permit
+    /// consumed, regardless of client_addr/dedup state.
+    #[tokio::test]
+    async fn svalinn_send_skipped_when_disabled() {
+        let server = DnsServer::new(disabled_config()).await.unwrap();
+        let addr: SocketAddr = "203.0.113.7:1".parse().unwrap();
+
+        // Disabled state builds a permit count of SVALINN_MAX_INFLIGHT too
+        // (the semaphore is always constructed), but no send should ever
+        // touch it since the function returns before reaching the gate.
+        server.maybe_send_svalinn_dga_event(Some(addr), "evil.example.com", &sample_dga_score("evil"));
+
+        assert_eq!(server.svalinn_inflight.available_permits(), SVALINN_MAX_INFLIGHT);
+    }
+
+    /// `svalinn.enabled: true` + DGA detection enabled, with resolution
+    /// backed by an UNREACHABLE upstream and a very short timeout, so a
+    /// full `handle_query_internal` call (resolution included) completes
+    /// quickly and deterministically without depending on real network
+    /// reachability. `192.0.2.1` is RFC 5737 TEST-NET-1 (reserved,
+    /// guaranteed non-routable), and `timeout_ms: 50` bounds the forwarder's
+    /// wait for a reply that will never arrive.
+    fn fast_forward_config_with_dga() -> Config {
+        serde_yaml::from_str(
+            "mode: forward\n\
+             upstream:\n\
+             \x20 servers:\n\
+             \x20   - \"192.0.2.1:53\"\n\
+             \x20 timeout_ms: 50\n\
+             dga:\n\
+             \x20 enabled: true\n\
+             svalinn:\n\
+             \x20 enabled: true\n\
+             \x20 url: \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap()
+    }
+
+    /// Minimal hand-rolled raw-bytes DNS query for tests that must drive
+    /// `handle_query_internal` directly (mirrors `resolver::build_dns_query`'s
+    /// wire-format approach, without the EDNS0 OPT record -- not needed
+    /// here since this query is never actually sent anywhere reachable).
+    fn build_raw_dns_query(qname: &str) -> Bytes {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x1234u16.to_be_bytes()); // transaction id
+        buf.extend_from_slice(&[0x01, 0x00]); // standard query, RD=1
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QDCOUNT=1
+        for label in qname.trim_end_matches('.').split('.').filter(|s| !s.is_empty()) {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label.as_bytes());
+        }
+        buf.push(0x00); // root label
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        Bytes::from(buf)
+    }
+
+    /// Same wire-format construction as `build_raw_dns_query` above, but
+    /// takes raw label byte slices directly instead of a `&str` split on
+    /// `.` -- needed for the NEW-1 regression test below, which requires a
+    /// label containing bytes that are not valid UTF-8 (impossible to
+    /// express as a Rust `&str` literal).
+    fn build_raw_dns_query_from_labels(labels: &[&[u8]]) -> Bytes {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0x1234u16.to_be_bytes()); // transaction id
+        buf.extend_from_slice(&[0x01, 0x00]); // standard query, RD=1
+        buf.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QDCOUNT=1
+        for label in labels {
+            buf.push(label.len() as u8);
+            buf.extend_from_slice(label);
+        }
+        buf.push(0x00); // root label
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QTYPE = A
+        buf.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        Bytes::from(buf)
+    }
+
+    /// Round-3 regression test for the headline bug: drives the REAL
+    /// production call site (`handle_query_internal`), not
+    /// `maybe_send_svalinn_dga_event` in isolation like round 2's
+    /// `svalinn_send_dedup_keys_on_client_ip_and_label` test above did.
+    /// That's exactly why round 2's test passed while the real bug was
+    /// live -- it bypassed the call site where the bug actually was.
+    ///
+    /// The bug: `maybe_send_svalinn_dga_event` was called *inside*
+    /// `if !already_seen` (the label-only local-log dedup), so a second,
+    /// distinct client IP querying a label some earlier client already
+    /// triggered the local `warn!` for never even reached
+    /// `maybe_send_svalinn_dga_event` -- making that method's own
+    /// (client_ip, label) dedup permanently unreachable in production.
+    ///
+    /// Uses the same "pre-exhaust the gate, observe `svalinn_events_dropped`"
+    /// technique as `svalinn_inflight_gate_drops_event_and_counts_it_when_full`
+    /// above: with every permit already held, any call that reaches
+    /// `maybe_send_svalinn_dga_event`'s `try_acquire_owned()` gate
+    /// deterministically and synchronously increments the dropped counter
+    /// -- no network dependency, no timing flakiness, and critically: if a
+    /// call does NOT reach that gate at all (the bug), the counter simply
+    /// does not move.
+    #[tokio::test]
+    async fn handle_query_internal_forwards_second_distinct_client_for_already_locally_logged_label() {
+        let server = DnsServer::new(fast_forward_config_with_dga()).await.unwrap();
+
+        // Pre-exhaust the concurrency gate so any call reaching
+        // `maybe_send_svalinn_dga_event`'s gate check is observable via
+        // `svalinn_events_dropped` without needing the spawned HTTP send
+        // to actually complete (it never even spawns when the gate is
+        // full).
+        let mut held_permits = Vec::new();
+        for _ in 0..SVALINN_MAX_INFLIGHT {
+            held_permits.push(
+                server
+                    .svalinn_inflight
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("gate should not be exhausted yet"),
+            );
+        }
+
+        // A DGA-scoring domain (one of dga.rs's own high-scoring fixtures,
+        // see `dga_like_domains_score_high`).
+        let query_bytes = build_raw_dns_query("xkjqwzpqmnbvcxzl.com");
+
+        let addr_a: SocketAddr = "203.0.113.50:1".parse().unwrap();
+        let addr_b: SocketAddr = "203.0.113.51:1".parse().unwrap();
+
+        let before = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Client A's query: this is the FIRST time this label is seen, so
+        // the local `warn!` fires, AND the call must reach the SVALINN
+        // send gate. Resolution itself fails (unreachable upstream,
+        // TEST-NET-1) -- irrelevant to what this test proves, so the
+        // `Result` is discarded.
+        let _ = server
+            .handle_query_internal(query_bytes.clone(), Some(addr_a))
+            .await;
+
+        let after_a = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after_a,
+            before + 1,
+            "client A's first query for this label must reach the SVALINN \
+             send gate (dropped-counter must move)"
+        );
+
+        // Client B: a DIFFERENT client IP querying the SAME label. The
+        // local `warn!` dedup (`dga_alert_seen`, label-only) suppresses
+        // the log for this label a second time -- but that must NOT stop
+        // this call from reaching `maybe_send_svalinn_dga_event`. This is
+        // the exact bug under test: before the round-3 hoisting fix, the
+        // send call was nested inside `if !already_seen`, so this request
+        // would never have reached the gate at all and the counter would
+        // not move here.
+        let _ = server
+            .handle_query_internal(query_bytes.clone(), Some(addr_b))
+            .await;
+
+        let after_b = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after_b,
+            after_a + 1,
+            "client B (a distinct client IP querying the same already-\
+             locally-logged label) must STILL reach the SVALINN send gate \
+             -- if this fails, the round-3 hoisting fix regressed and the \
+             call is once again unreachable for any client after the first"
+        );
+
+        drop(held_permits);
+    }
+
+    /// Round-4 fix regression test (NEW-1): a query whose registrable label
+    /// scores above the DGA threshold, but which also contains a DIFFERENT
+    /// (non-registrable, leading) label that is not valid UTF-8, must skip
+    /// the SVALINN send via `build_alert_domain` returning `None` -- and
+    /// that skip must now be observable: `svalinn_events_skipped_invalid_utf8`
+    /// increments by exactly one, and critically `maybe_send_svalinn_dga_event`
+    /// must never even be reached (no permit consumed, `svalinn_events_dropped`
+    /// unchanged) -- proving the `None` branch short-circuits before the send
+    /// path, not just that some counter somewhere moved.
+    #[tokio::test]
+    async fn handle_query_internal_counts_and_logs_invalid_utf8_domain_skip() {
+        let server = DnsServer::new(fast_forward_config_with_dga()).await.unwrap();
+
+        // Leading (non-registrable) label is deliberately invalid UTF-8;
+        // the registrable label ("xkjqwzpqmnbvcxzl") is the same
+        // known-high-scoring fixture used elsewhere in this file, and is
+        // itself valid UTF-8/ASCII so the DGA scorer still fires.
+        let invalid_label: &[u8] = &[0xFF, 0xFE];
+        let query_bytes = build_raw_dns_query_from_labels(&[
+            invalid_label,
+            b"xkjqwzpqmnbvcxzl",
+            b"com",
+        ]);
+
+        let addr: SocketAddr = "203.0.113.90:1".parse().unwrap();
+
+        let skipped_before = server
+            .stats
+            .svalinn_events_skipped_invalid_utf8
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let dropped_before = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let permits_before = server.svalinn_inflight.available_permits();
+
+        let _ = server.handle_query_internal(query_bytes, Some(addr)).await;
+
+        let skipped_after = server
+            .stats
+            .svalinn_events_skipped_invalid_utf8
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let dropped_after = server
+            .stats
+            .svalinn_events_dropped
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            skipped_after,
+            skipped_before + 1,
+            "a non-UTF-8 label must increment svalinn_events_skipped_invalid_utf8"
+        );
+        assert_eq!(
+            dropped_after, dropped_before,
+            "the invalid-UTF-8 skip path must never reach \
+             maybe_send_svalinn_dga_event, so svalinn_events_dropped must \
+             not move"
+        );
+        assert_eq!(
+            server.svalinn_inflight.available_permits(),
+            permits_before,
+            "the invalid-UTF-8 skip path must never consume a concurrency permit"
+        );
+    }
+
+    /// Round-4 fix regression test (NEW-3): when SVALINN is disabled, a
+    /// DGA-scoring query must not even attempt `build_alert_domain` --
+    /// verified here via the disabled-config path reaching the exact same
+    /// point in `handle_query_internal` without panicking or behaving
+    /// differently, combined with the code-inspection evidence in this
+    /// round's report (the `if self.svalinn_client.is_some()` guard now
+    /// wraps the `build_alert_domain` call entirely, so the allocation
+    /// inside it is provably unreachable when disabled -- see call site
+    /// comment). This test's role is to confirm the disabled path still
+    /// behaves as a true no-op end-to-end through the real call site, not
+    /// just in the isolated `maybe_send_svalinn_dga_event` unit tests above.
+    #[tokio::test]
+    async fn handle_query_internal_disabled_svalinn_never_reaches_send_path() {
+        let mut config: Config = serde_yaml::from_str(
+            "mode: forward\n\
+             upstream:\n\
+             \x20 servers:\n\
+             \x20   - \"192.0.2.1:53\"\n\
+             \x20 timeout_ms: 50\n\
+             dga:\n\
+             \x20 enabled: true\n",
+        )
+        .unwrap();
+        // svalinn.enabled defaults to false -- explicit for clarity.
+        config.svalinn.enabled = false;
+        let server = DnsServer::new(config).await.unwrap();
+        assert!(server.svalinn_client.is_none());
+
+        // Deliberately a non-UTF-8 leading label (not a plain ASCII domain):
+        // if the NEW-3 disabled-path guard were ever removed/reordered so
+        // that `build_alert_domain` runs before the `svalinn_client.is_some()`
+        // check, an all-ASCII query would still score >=0.5 and skip the
+        // counter for an unrelated reason (DGA score too low), making the
+        // assertions below pass regardless of whether the guard exists --
+        // exactly the vacuous-test gap an adversarial review caught in the
+        // prior version of this test. A non-UTF-8 label forces
+        // build_alert_domain to return None (and, if reached, increment the
+        // skip counter), so this test only stays green if the guard
+        // genuinely prevents build_alert_domain from running at all.
+        let query_bytes = build_raw_dns_query_from_labels(&[
+            &[0xFF, 0xFE],
+            b"xkjqwzpqmnbvcxzl",
+            b"com",
+        ]);
+        let addr: SocketAddr = "203.0.113.91:1".parse().unwrap();
+
+        let skipped_before = server
+            .stats
+            .svalinn_events_skipped_invalid_utf8
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        let _ = server.handle_query_internal(query_bytes, Some(addr)).await;
+
+        let skipped_after = server
+            .stats
+            .svalinn_events_skipped_invalid_utf8
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            skipped_after, skipped_before,
+            "disabled SVALINN must never touch the invalid-UTF-8 skip \
+             counter either -- build_alert_domain must not even be called"
+        );
+        assert_eq!(
+            server.svalinn_inflight.available_permits(),
+            SVALINN_MAX_INFLIGHT,
+            "disabled SVALINN must never consume a permit"
+        );
     }
 }

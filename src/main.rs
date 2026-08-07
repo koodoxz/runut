@@ -20,6 +20,7 @@ mod filter;
 mod forwarder;
 mod metrics;
 mod resolver;  // Recursive resolver (NO 3rd-party upstream)
+mod svalinn;
 mod xdp;
 
 use config::Config;

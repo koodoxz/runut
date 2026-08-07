@@ -67,7 +67,7 @@ impl DnsServer {
                         let service = service_fn(move |req| {
                             let server = server.clone();
                             async move {
-                                handle_doh_request(req, server).await
+                                handle_doh_request(req, server, peer).await
                             }
                         });
                         
@@ -92,6 +92,7 @@ impl DnsServer {
 async fn handle_doh_request(
     req: Request<Incoming>,
     server: Arc<DnsServer>,
+    peer: SocketAddr,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let path = req.uri().path();
     
@@ -167,7 +168,7 @@ async fn handle_doh_request(
     };
     
     // Process DNS query
-    match server.handle_query(dns_query).await {
+    match server.handle_query(dns_query, Some(peer)).await {
         Ok(response) => {
             Ok(Response::builder()
                 .status(StatusCode::OK)

@@ -76,7 +76,7 @@ impl DnsServer {
                             }
                             
                             // Process query
-                            match server.handle_query(Bytes::from(buf)).await {
+                            match server.handle_query(Bytes::from(buf), Some(peer)).await {
                                 Ok(response) => {
                                     // Write length prefix + response
                                     let len_bytes = (response.len() as u16).to_be_bytes();
