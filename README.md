@@ -25,6 +25,43 @@
 
 ---
 
+## The Defense Ecosystem
+
+Runut operates as the core resolution brain within a unified, defense-in-depth security infrastructure:
+
+```
+[ Client / Edge Devices ]
+           │
+           ▼ (Plaintext DNS on localhost)
+   ┌──────────────┐
+   │    Caraka    │  Lightweight DNS over QUIC (DoQ) Edge Forwarder
+   └──────┬───────┘
+          │ (Encrypted DoQ / QUIC - Port 8853)
+          ▼
+   ┌──────────────┐   eBPF / XDP Kernel Sentry
+   │    Gapura    │◄───[ Kalas ] (Layer 3 & Layer 4 Anti-DDoS Filter)
+   └──────┬───────┘   Public Ingress Gateway (Rate-Limiting & TLS Termination)
+          │
+          │ (Internal Private Wire)
+          ▼
+   ┌──────────────┐   Real-Time Threat Feeds
+   │    Runut     │◄─────────────────────────► [ Tameng ]
+   └──────┬───────┘   Authoritative Root DNS   Autonomous L7 WAF
+          │
+          ▼ (Direct iterative queries)
+[ 13 Internet Root Servers (A.ROOT .. M.ROOT) ]
+```
+
+| Component | Layer / Scope | Role in Ecosystem |
+| :--- | :--- | :--- |
+| **[Tameng](https://github.com/koodoxz/tameng)** | Layer 7 (Application) | Autonomous Web Application Firewall, Behavioral Defense, and Threat Intelligence Hub |
+| **[Runut](https://github.com/koodoxz/runut)** | Layer 7 (DNS Core) | High-Performance Zero-GC Recursive Root Resolver and DGA/Tunneling Sentinel |
+| **[Gapura](https://github.com/koodoxz/gapura)** | Ingress Gateway | Public entry portal terminating DoH, DoT, and DoQ with token-bucket rate limiting |
+| **[Kalas](https://github.com/koodoxz/kalas)** | Layer 3 & 4 (Kernel) | eBPF/XDP sentinel dropping packet floods (SYN flood, port scans) at wire speed |
+| **[Caraka](https://github.com/koodoxz/caraka)** | Client / Edge | Zero-round-trip local proxy forwarding endpoint queries over encrypted QUIC |
+
+---
+
 ## Core Capabilities
 
 - **Dual-Engine Resolution**:
