@@ -89,6 +89,22 @@ impl DnsServer {
 }
 
 /// Handle DoH HTTP request
+/// Helper to build safe responses with fallback
+fn build_response(status: StatusCode, body: Bytes, content_type: Option<&str>) -> Response<Full<Bytes>> {
+    let mut builder = Response::builder()
+        .status(status)
+        .header("Access-Control-Allow-Origin", "*");
+    
+    if let Some(ct) = content_type {
+        builder = builder.header("Content-Type", ct);
+    }
+    
+    builder.body(Full::new(body)).unwrap_or_else(|_| {
+        Response::new(Full::new(Bytes::from_static(b"Internal Server Error")))
+    })
+}
+
+/// Handle DoH HTTP request
 async fn handle_doh_request(
     req: Request<Incoming>,
     server: Arc<DnsServer>,
@@ -98,23 +114,20 @@ async fn handle_doh_request(
     
     // Handle CORS preflight for browser compatibility (RFC 8484)
     if req.method() == Method::OPTIONS {
-        return Ok(Response::builder()
+        let resp = Response::builder()
             .status(StatusCode::NO_CONTENT)
             .header("Access-Control-Allow-Origin", "*")
             .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             .header("Access-Control-Allow-Headers", "Content-Type")
             .header("Access-Control-Max-Age", "86400")
             .body(Full::new(Bytes::new()))
-            .unwrap());
+            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+        return Ok(resp);
     }
     
     // Only handle /dns-query and /.well-known/dns-query
     if path != "/dns-query" && path != "/.well-known/dns-query" {
-        return Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header("Access-Control-Allow-Origin", "*")
-            .body(Full::new(Bytes::from("404 Not Found")))
-            .unwrap());
+        return Ok(build_response(StatusCode::NOT_FOUND, Bytes::from("404 Not Found"), None));
     }
     
     let dns_query = match *req.method() {
@@ -134,11 +147,7 @@ async fn handle_doh_request(
                 .unwrap_or("");
             
             if !content_type.contains(DNS_MESSAGE_TYPE) {
-                return Ok(Response::builder()
-                    .status(StatusCode::UNSUPPORTED_MEDIA_TYPE)
-                    .header("Access-Control-Allow-Origin", "*")
-                    .body(Full::new(Bytes::from("415 Unsupported Media Type")))
-                    .unwrap());
+                return Ok(build_response(StatusCode::UNSUPPORTED_MEDIA_TYPE, Bytes::from("415 Unsupported Media Type"), None));
             }
             
             // Read body
@@ -148,46 +157,33 @@ async fn handle_doh_request(
             }
         }
         _ => {
-            return Ok(Response::builder()
-                .status(StatusCode::METHOD_NOT_ALLOWED)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Full::new(Bytes::from("405 Method Not Allowed")))
-                .unwrap());
+            return Ok(build_response(StatusCode::METHOD_NOT_ALLOWED, Bytes::from("405 Method Not Allowed"), None));
         }
     };
     
     let dns_query = match dns_query {
         Some(q) if !q.is_empty() => q,
         _ => {
-            return Ok(Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Full::new(Bytes::from("400 Bad Request - Invalid DNS query")))
-                .unwrap());
+            return Ok(build_response(StatusCode::BAD_REQUEST, Bytes::from("400 Bad Request - Invalid DNS query"), None));
         }
     };
     
     // Process DNS query
     match server.handle_query(dns_query, Some(peer)).await {
         Ok(response) => {
-            Ok(Response::builder()
+            let resp = Response::builder()
                 .status(StatusCode::OK)
                 .header("Content-Type", DNS_MESSAGE_TYPE)
                 .header("Content-Length", response.len().to_string())
                 .header("Access-Control-Allow-Origin", "*")
                 .header("Cache-Control", "max-age=300")
                 .body(Full::new(response))
-                .unwrap())
+                .unwrap_or_else(|_| Response::new(Full::new(Bytes::from_static(b"Internal Server Error"))));
+            Ok(resp)
         }
         Err(e) => {
             debug!("DoH query processing error: {}", e);
-            let body = Bytes::from("500 DNS Processing Error");
-            Ok(Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .header("Content-Length", body.len().to_string())
-                .header("Access-Control-Allow-Origin", "*")
-                .body(Full::new(body))
-                .unwrap())
+            Ok(build_response(StatusCode::INTERNAL_SERVER_ERROR, Bytes::from("500 DNS Processing Error"), None))
         }
     }
 }

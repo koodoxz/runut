@@ -372,20 +372,20 @@ impl DnsServer {
             stats,
             xdp_sync,
             dga_alert_seen: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(10_000).unwrap(),
+                std::num::NonZeroUsize::new(10_000).unwrap_or(std::num::NonZeroUsize::MIN),
             )),
             tameng_client,
             tameng_failure_gate: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tameng_inflight: Arc::new(tokio::sync::Semaphore::new(TAMENG_MAX_INFLIGHT)),
             tameng_send_seen: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(TAMENG_SEND_DEDUP_CAPACITY).unwrap(),
+                std::num::NonZeroUsize::new(TAMENG_SEND_DEDUP_CAPACITY).unwrap_or(std::num::NonZeroUsize::MIN),
             )),
             tunnel_tracker,
             tunnel_alert_seen: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(TUNNEL_ALERT_DEDUP_CAPACITY).unwrap(),
+                std::num::NonZeroUsize::new(TUNNEL_ALERT_DEDUP_CAPACITY).unwrap_or(std::num::NonZeroUsize::MIN),
             )),
             tunnel_tameng_send_seen: parking_lot::Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(TUNNEL_TAMENG_SEND_DEDUP_CAPACITY).unwrap(),
+                std::num::NonZeroUsize::new(TUNNEL_TAMENG_SEND_DEDUP_CAPACITY).unwrap_or(std::num::NonZeroUsize::MIN),
             )),
         })
     }
