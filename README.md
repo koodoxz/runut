@@ -4,14 +4,14 @@
 > Sub-millisecond latency, zero garbage collection, multi-protocol resolution, and real-time active threat defense.
 
 [![Rust](https://img.shields.io/badge/Rust-1.75+-000000?style=flat&logo=rust)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Protocols](https://img.shields.io/badge/Protocols-UDP%20%7C%20TCP%20%7C%20DoT%20%7C%20DoH%20%7C%20DoQ-green.svg)](#features)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
+[![Protocols](https://img.shields.io/badge/Protocols-UDP%20%7C%20TCP%20%7C%20DoT%20%7C%20DoH%20%7C%20DoQ-green.svg)](#architecture--modes)
 
 ---
 
-## ⚡ Executive Summary
+## Executive Summary
 
-**Runut** (Indonesian: *"to trace / track systematically"*) is an enterprise-grade DNS resolver and security gateway built in pure Rust. It is engineered to replace legacy DNS servers with a zero-cost abstraction stack that eliminates GC pauses and withstands high-QPS network stress.
+**Runut** (Indonesian: *"to trace / track systematically"*) is a high-performance DNS resolver and security gateway built in pure Rust. It is engineered to replace legacy DNS servers with a zero-cost abstraction stack that eliminates GC pauses and withstands high-QPS network stress.
 
 ### Benchmarks (Directional Baseline)
 | Metric | Go Reference Implementation | Runut (Rust) | Delta |
@@ -25,8 +25,11 @@
 
 ---
 
-## 🛡️ Core Capabilities
+## Core Capabilities
 
+- **Dual-Engine Resolution**:
+  - **Recursive Root Resolver**: Resolves directly from authoritative Internet Root Servers (`A.ROOT-SERVERS.NET` through `M.ROOT-SERVERS.NET`) with built-in NS-cache and socket pooling.
+  - **Forwarding Gateway**: Low-latency proxying to upstream DNS providers with round-robin health-checking.
 - **Zero-GC Predictability**: Built on Tokio multi-thread runtime with strict asynchronous socket multiplexing.
 - **Full Protocol Coverage**:
   - Classic **UDP & TCP** (RFC 1035) with sharded worker threads.
@@ -34,7 +37,7 @@
   - **DoH** (DNS over HTTPS - RFC 8484) with HTTP/2 and CORS preflight.
   - **DoQ** (DNS over QUIC - RFC 9250) via `quinn` for zero round-trip connection resumption.
 - **Sharded Lock-Free Cache**: Concurrent LRU caching with lock sharding to prevent lock contention under 10k+ concurrent clients.
-- **O(1) Threat Filtering**: Sub-microsecond Bloom filter matching against millions of malicious domains.
+- **Sub-Microsecond Filtering**: Bloom filter matching against millions of malicious domains.
 - **Active Defense Integration**: Native bidirectional sync with shield gateways (e.g., [Tameng](https://github.com/koodoxz/tameng)) for real-time threat intelligence feeds.
 - **Heuristic Threat Detection**:
   - **DGA Engine**: Entropy and n-gram scoring for algorithmic domain generation attacks.
@@ -42,7 +45,38 @@
 
 ---
 
-## 🚀 Quick Start
+## Architecture & Modes
+
+Runut supports two operational modes defined in `configs/runut.yaml`:
+
+### 1. Full Recursive Root Mode (Default)
+In this mode, Runut acts as a **true authoritative recursive resolver** without depending on any external upstream resolvers (Google, Cloudflare, Quad9). It queries the 13 Root hints, follows TLD delegations, and caches nameserver authoritative responses directly:
+```yaml
+mode: recursive
+
+resolver:
+  timeout_ms: 5000
+  max_retries: 3
+  max_depth: 30
+  pool_size: 50
+```
+
+### 2. Forwarding Mode (Optional)
+If your infrastructure requires routing through dedicated upstream DNS providers or corporate resolvers:
+```yaml
+mode: forward
+
+upstream:
+  servers:
+    - "1.1.1.1:53"
+    - "8.8.8.8:53"
+  timeout_ms: 2000
+  tcp_fallback: true
+```
+
+---
+
+## Quick Start
 
 ### 1. Requirements & Build
 * **Recommended OS**: Linux (Ubuntu 22.04+, Debian 12+, RHEL 9+) with Kernel 5.15+ (optimal for `SO_REUSEPORT` and eBPF/XDP).
@@ -60,11 +94,11 @@ cargo build --release
 
 ### 2. Run Standalone
 ```bash
-# Run with default configuration
+# Run with default recursive configuration
 sudo ./target/release/runut --config configs/runut.yaml
 
 # Or execute with CLI arguments
-sudo ./target/release/runut --listen 0.0.0.0:53 --upstream 1.1.1.1:53
+sudo ./target/release/runut --listen 0.0.0.0:53
 ```
 
 ### 3. Run with Docker
@@ -75,9 +109,9 @@ docker run -d --name runut-dns -p 53:53/udp -p 53:53/tcp runut
 
 ---
 
-## ⚙️ Configuration Architecture
+## Configuration Reference
 
-The complete configuration is governed by a declarative YAML file (`configs/runut.yaml`):
+The complete configuration is governed by `configs/runut.yaml`:
 
 ```yaml
 listen:
@@ -87,11 +121,14 @@ listen:
   doh: "0.0.0.0:443"   # DNS over HTTPS
   doq: "0.0.0.0:853"   # DNS over QUIC
 
-upstream:
-  servers:
-    - "1.1.1.1:53"
-    - "8.8.8.8:53"
-  timeout_ms: 2000
+# Resolution mode: "recursive" (authoritative from root) or "forward"
+mode: recursive
+
+resolver:
+  timeout_ms: 5000
+  max_retries: 3
+  max_depth: 30
+  pool_size: 50
 
 cache:
   enabled: true
@@ -112,17 +149,20 @@ tameng:
 
 ---
 
-## 🗺️ Project Status & Roadmap
+## Project Status & Roadmap
+
+The current version focuses on core resolution stability and cryptographic protocol hardening:
 
 - [x] High-performance UDP / TCP async multiplexing
+- [x] Recursive Root Resolver with NS cache & connection pooling
 - [x] Sharded LRU cache with TTL auto-expiration
 - [x] Encrypted transport (DoT, DoH, DoQ)
 - [x] Sovereign Code Hunter safety verification (Zero naked panics in worker loop)
-- [ ] Automated eBPF/XDP kernel bypass kernel driver packaging
+- [ ] Automated eBPF/XDP kernel bypass driver packaging
 - [ ] Dynamic Kubernetes sidecar deployment helm chart
 
 ---
 
-## 📄 License & Intellectual Property
+## License & Intellectual Property
 
-Licensed under the [MIT License](LICENSE). Open for community contributions and enterprise adoption.
+Licensed under the **GNU Affero General Public License v3.0 or later ([AGPL-3.0-or-later](LICENSE))**. Open for community contributions, with source-sharing requirements for network-deployed service modifications.

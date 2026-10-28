@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Runut Contributors"]
 description = "Ultra Blazzing Fast DNS Guardian - Rust Edition"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 # Async runtime
