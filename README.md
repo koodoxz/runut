@@ -56,9 +56,9 @@ Runut operates as the core resolution brain within a unified, defense-in-depth s
 | :--- | :--- | :--- |
 | **[Tameng](https://github.com/koodoxz/tameng)** | Layer 7 (Application) | Autonomous Web Application Firewall, Behavioral Defense, and Threat Intelligence Hub |
 | **[Runut](https://github.com/koodoxz/runut)** | Layer 7 (DNS Core) | High-Performance Zero-GC Recursive Root Resolver and DGA/Tunneling Sentinel |
-| **[Gapura](https://github.com/koodoxz/gapura)** | Ingress Gateway | Public entry portal terminating DoH, DoT, and DoQ with token-bucket rate limiting |
-| **[Kalas](https://github.com/koodoxz/kalas)** | Layer 3 & 4 (Kernel) | eBPF/XDP sentinel dropping packet floods (SYN flood, port scans) at wire speed |
-| **[Caraka](https://github.com/koodoxz/caraka)** | Client / Edge | Zero-round-trip local proxy forwarding endpoint queries over encrypted QUIC |
+| **Gapura** *(Coming Soon)* | Ingress Gateway | Public entry portal terminating DoH, DoT, and DoQ with token-bucket rate limiting |
+| **Kalas** *(Coming Soon)* | Layer 3 & 4 (Kernel) | eBPF/XDP sentinel dropping packet floods (SYN flood, port scans) at wire speed |
+| **Caraka** *(Coming Soon)* | Client / Edge | Zero-round-trip local proxy forwarding endpoint queries over encrypted QUIC |
 
 ---
 
