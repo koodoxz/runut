@@ -1,11 +1,11 @@
 //! Metrics Module
 //!
-//! Prometheus metrics export for MIMIR-RS.
+//! Prometheus metrics export for RUNUT.
 
 use prometheus::{Counter, Gauge, Histogram, HistogramOpts, Opts, Registry};
 use std::sync::Arc;
 
-/// MIMIR metrics
+/// RUNUT metrics
 pub struct Metrics {
     pub registry: Registry,
     
@@ -32,41 +32,41 @@ impl Metrics {
         
         // Counters
         let queries_total = Counter::with_opts(
-            Opts::new("mimir_queries_total", "Total DNS queries received")
+            Opts::new("runut_queries_total", "Total DNS queries received")
         ).unwrap();
         
         let queries_cached = Counter::with_opts(
-            Opts::new("mimir_queries_cached", "Queries served from cache")
+            Opts::new("runut_queries_cached", "Queries served from cache")
         ).unwrap();
         
         let queries_blocked = Counter::with_opts(
-            Opts::new("mimir_queries_blocked", "Queries blocked by filter")
+            Opts::new("runut_queries_blocked", "Queries blocked by filter")
         ).unwrap();
         
         let queries_forwarded = Counter::with_opts(
-            Opts::new("mimir_queries_forwarded", "Queries forwarded to upstream")
+            Opts::new("runut_queries_forwarded", "Queries forwarded to upstream")
         ).unwrap();
         
         let queries_failed = Counter::with_opts(
-            Opts::new("mimir_queries_failed", "Failed queries")
+            Opts::new("runut_queries_failed", "Failed queries")
         ).unwrap();
         
         // Gauges
         let cache_size = Gauge::with_opts(
-            Opts::new("mimir_cache_size", "Current cache size")
+            Opts::new("runut_cache_size", "Current cache size")
         ).unwrap();
         
         let blocklist_size = Gauge::with_opts(
-            Opts::new("mimir_blocklist_size", "Blocklist entries count")
+            Opts::new("runut_blocklist_size", "Blocklist entries count")
         ).unwrap();
         
         let upstreams_healthy = Gauge::with_opts(
-            Opts::new("mimir_upstreams_healthy", "Number of healthy upstreams")
+            Opts::new("runut_upstreams_healthy", "Number of healthy upstreams")
         ).unwrap();
         
         // Histograms
         let query_duration = Histogram::with_opts(
-            HistogramOpts::new("mimir_query_duration_seconds", "Query processing time")
+            HistogramOpts::new("runut_query_duration_seconds", "Query processing time")
                 .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0])
         ).unwrap();
         

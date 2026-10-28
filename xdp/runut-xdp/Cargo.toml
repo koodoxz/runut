@@ -1,5 +1,5 @@
 [package]
-name = "mimir-xdp"
+name = "runut-xdp"
 version = "0.1.0"
 edition = "2021"
 
@@ -28,5 +28,5 @@ trust-dns-proto = "0.23"
 bytes = "1"
 
 [[bin]]
-name = "mimir-xdp"
+name = "runut-xdp"
 path = "src/main.rs"

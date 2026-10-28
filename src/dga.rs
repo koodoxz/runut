@@ -11,7 +11,7 @@
 //! (e.g. "d1a2b3c4.cloudfront.net" scores on "cloudfront", not "d1a2b3c4").
 //! ponytail: subdomain-level scoring (needed for DNS-tunneling detection,
 //! not DGA) is a separate, already-built feature -- see `tunnel.rs`, REQ
-//! MIMIR-DNS-TUNNEL-DETECT-001.
+//! RUNUT-DNS-TUNNEL-DETECT-001.
 //!
 //! Operates on raw wire-format DNS label bytes (e.g. from iterating a
 //! `trust_dns_proto::rr::Name`), not a pre-formatted display string -- see
@@ -112,14 +112,14 @@ fn registrable_label(labels: &[&[u8]]) -> Option<Vec<u8>> {
 /// (`[b"data1", b"agvsbg8"]`, `[b"evil", b"com"]`). Returns `None` under the
 /// same conditions `registrable_label` does (fewer than 2 non-empty labels).
 ///
-/// Built for REQ MIMIR-DNS-TUNNEL-DETECT-001 (see tunnel.rs), which needs to
+/// Built for REQ RUNUT-DNS-TUNNEL-DETECT-001 (see tunnel.rs), which needs to
 /// key a per-domain tracker on the registrable domain while separately
 /// hashing the more-specific subdomain chain above it.
 ///
 /// # Why the registrable domain is `Vec<Vec<u8>>`, not a joined `Vec<u8>`
 ///
 /// A dot-joined byte string was considered and rejected. `dga.rs`'s own
-/// `score` and `svalinn::build_alert_domain` both have extensive doc
+/// `score` and `tameng::build_alert_domain` both have extensive doc
 /// comments/regression tests establishing that joining raw wire-format
 /// labels with a literal `.` byte is unsafe in general: RFC 1035 labels are
 /// length-prefixed, not dot-delimited, so a literal `.` (or `\`) byte
@@ -131,7 +131,7 @@ fn registrable_label(labels: &[&[u8]]) -> Option<Vec<u8>> {
 /// join step at all, so each element unambiguously round-trips as exactly
 /// the label it came from -- no delimiter, no escaping, no desync surface.
 /// Callers that need a safe *display* string for logging (e.g.
-/// `tunnel::evaluate`) still go through `svalinn::build_alert_domain`
+/// `tunnel::evaluate`) still go through `tameng::build_alert_domain`
 /// separately for that purpose.
 ///
 /// Both the subdomain and registrable label bytes returned are
@@ -177,7 +177,7 @@ pub(crate) fn split_subdomain_and_registrable(labels: &[&[u8]]) -> Option<(Vec<V
 
 /// Shannon entropy of `s`, in bits per character over the character
 /// frequency distribution. `pub(crate)`: reused directly by
-/// `tunnel::evaluate` (MIMIR-DNS-TUNNEL-DETECT-001) to avoid a second copy
+/// `tunnel::evaluate` (RUNUT-DNS-TUNNEL-DETECT-001) to avoid a second copy
 /// of this math -- see this file's module doc comment for why
 /// tunnel-detection was deliberately kept out of the original DGA REQ, and
 /// tunnel.rs for why it computes entropy over the full concatenated
@@ -222,7 +222,7 @@ pub(crate) fn shannon_entropy(s: &str) -> f64 {
 /// proportionally lower absolute bar, which is the intended fix.
 ///
 /// `pub(crate)`: reused directly by `tunnel::evaluate`
-/// (MIMIR-DNS-TUNNEL-DETECT-001) for the same length-scaled-ceiling reason
+/// (RUNUT-DNS-TUNNEL-DETECT-001) for the same length-scaled-ceiling reason
 /// this was originally written for, applied to a subdomain chain instead of
 /// a single registrable label -- see `shannon_entropy`'s doc comment.
 pub(crate) fn entropy_ratio(s: &str, len: usize) -> f64 {
@@ -242,7 +242,7 @@ pub(crate) fn entropy_ratio(s: &str, len: usize) -> f64 {
 /// the derivation living next to the comment that explains it.
 ///
 /// `pub(crate)`: reused directly by `tunnel::evaluate`
-/// (MIMIR-DNS-TUNNEL-DETECT-001) as the trigger bar for its own
+/// (RUNUT-DNS-TUNNEL-DETECT-001) as the trigger bar for its own
 /// `high_entropy_subdomain_chain` corroborating reason, rather than a second
 /// independently-hand-picked threshold living next to this one.
 pub(crate) fn high_entropy_ratio_threshold() -> f64 {
@@ -609,7 +609,7 @@ mod tests {
         );
     }
 
-    // ---- split_subdomain_and_registrable (MIMIR-DNS-TUNNEL-DETECT-001) ----
+    // ---- split_subdomain_and_registrable (RUNUT-DNS-TUNNEL-DETECT-001) ----
     // Written before the implementation (TDD red phase) -- see this file's
     // module doc comment for why tunnel detection was deliberately deferred
     // out of the original DGA REQ, and tunnel.rs's module doc comment for

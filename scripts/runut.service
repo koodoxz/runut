@@ -1,5 +1,5 @@
 [Unit]
-Description=MIMIR-RS Ultra Fast DNS Guardian
+Description=RUNUT Ultra Fast DNS Guardian
 After=network.target
 Wants=network-online.target
 
@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=root
 Group=root
-ExecStart=/opt/mimir-rs/mimir --config /opt/mimir-rs/mimir.yaml --workers 0
+ExecStart=/opt/runut/runut --config /opt/runut/runut.yaml --workers 0
 Restart=always
 RestartSec=3
 
@@ -20,7 +20,7 @@ LimitCORE=infinity
 # NoNewPrivileges=true
 # ProtectSystem=strict
 # ProtectHome=true
-# ReadWritePaths=/opt/mimir-rs /var/log
+# ReadWritePaths=/opt/runut /var/log
 
 # CPU affinity (uncomment for multi-core)
 # CPUAffinity=0-7

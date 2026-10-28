@@ -1,5 +1,5 @@
 [package]
-name = "mimir-xdp-ebpf"
+name = "runut-xdp-ebpf"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,7 +8,7 @@ aya-ebpf = "0.1"
 aya-log-ebpf = "0.1"
 
 [[bin]]
-name = "mimir-xdp-ebpf"
+name = "runut-xdp-ebpf"
 path = "src/main.rs"
 
 [profile.dev]

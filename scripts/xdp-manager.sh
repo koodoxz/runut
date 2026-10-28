@@ -1,5 +1,5 @@
 #!/bin/bash
-# MIMIR XDP Autonomous Manager v1.0
+# RUNUT XDP Autonomous Manager v1.0
 # Automatically handles all XDP setup after the external XDP loader restarts
 # No manual intervention needed!
 
@@ -9,7 +9,7 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$LOG_TAG] $1"
 }
 
-log "Starting MIMIR XDP Autonomous Manager..."
+log "Starting RUNUT XDP Autonomous Manager..."
 log "Waiting for external XDP loader maps to be ready..."
 sleep 5
 
@@ -53,4 +53,4 @@ log "Pre-warming cache with popular domains..."
 
 # Start XDP sync with correct map ID
 log "Starting XDP Sync Bridge with map ID $DNS_CACHE_ID..."
-exec /opt/mimir-xdp/xdp-sync-v5 --map-id $DNS_CACHE_ID --sync-addr 127.0.0.1:9154 --stats-interval 30
+exec /opt/runut-xdp/xdp-sync-v5 --map-id $DNS_CACHE_ID --sync-addr 127.0.0.1:9154 --stats-interval 30

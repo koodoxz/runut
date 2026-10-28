@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MIMIR-XDP Sync Bridge - Python version with correct byte order"""
+"""RUNUT-XDP Sync Bridge - Python version with correct byte order"""
 import socket
 import struct
 import ctypes
@@ -70,7 +70,7 @@ def main():
     sync_addr = sys.argv[2] if len(sys.argv) > 2 else "127.0.0.1:9154"
     host, port = sync_addr.rsplit(':', 1)
     
-    print(f"🚀 MIMIR-XDP Sync Bridge v1.0 (Python)")
+    print(f"🚀 RUNUT-XDP Sync Bridge v1.0 (Python)")
     
     # Try path first, then ID
     if map_arg.startswith('/'):

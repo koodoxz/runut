@@ -1,4 +1,4 @@
-# MIMIR-RS Scaling Strategy
+# RUNUT Scaling Strategy
 
 ## Current Achievement
 - **#1 DNS Provider** on fastestdns.org benchmark
@@ -40,7 +40,7 @@
    ┌─────────┐      ┌─────────┐      ┌─────────┐
    │ SG VPS  │      │ ID VPS  │      │ EU VPS  │
    │ ODIN-RS │      │ ODIN-RS │      │ ODIN-RS │
-   │ MIMIR-RS│      │ MIMIR-RS│      │ MIMIR-RS│
+   │ RUNUT│      │ RUNUT│      │ RUNUT│
    │   XDP   │      │   XDP   │      │   XDP   │
    └─────────┘      └─────────┘      └─────────┘
 ```
@@ -49,7 +49,7 @@
 
 ## Key Points
 
-1. **Add more VPS nodes** with same MIMIR-RS + ODIN-RS stack
+1. **Add more VPS nodes** with same RUNUT + ODIN-RS stack
 2. **Anycast IP** → Route users to nearest server automatically
 3. **Load balancing** → Multiple ODIN gateways per region
 4. **GeoDNS** → DNS-based routing for initial connection

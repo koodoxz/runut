@@ -4,7 +4,7 @@
 # Cron: */15 * * * * /path/to/xdp-stability-check.sh
 #
 # NOTE: "xdp-loader" / "xdp-loader-rs" below are placeholder service names
-# for whatever separate XDP program loader you run alongside mimir (e.g. a
+# for whatever separate XDP program loader you run alongside runut (e.g. a
 # firewall/DDoS XDP loader). Rename to match your actual systemd unit(s).
 
 echo "=== XDP Stability Check - $(date) ==="
@@ -24,7 +24,7 @@ if [ $LOADER_COUNT -gt 1 ]; then
     systemctl is-enabled xdp-loader xdp-loader-rs 2>&1
 
     # Count XDP programs
-    XDP_COUNT=$(sudo bpftool prog list | grep -c -E 'xdp-loader|mimir')
+    XDP_COUNT=$(sudo bpftool prog list | grep -c -E 'xdp-loader|runut')
     echo ""
     echo "XDP programs attached: $XDP_COUNT (expected: 2)"
 
@@ -44,7 +44,7 @@ if [ $LOADER_COUNT -gt 1 ]; then
     fi
 else
     echo "✅ OK: Single XDP loader service running"
-    XDP_COUNT=$(sudo bpftool prog list | grep -c -E 'xdp-loader|mimir')
+    XDP_COUNT=$(sudo bpftool prog list | grep -c -E 'xdp-loader|runut')
     echo "✅ XDP programs: $XDP_COUNT"
 fi
 

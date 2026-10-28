@@ -1,11 +1,11 @@
 //! XDP Sync Client
 //!
-//! Synchronizes DNS cache entries from MIMIR-RS to the XDP/eBPF accelerator.
+//! Synchronizes DNS cache entries from RUNUT to the XDP/eBPF accelerator.
 
 use std::net::{SocketAddr, UdpSocket};
 use tracing::{debug, warn};
 
-/// Client for syncing cache to MIMIR-XDP
+/// Client for syncing cache to RUNUT-XDP
 pub struct XdpSyncClient {
     socket: UdpSocket,
     target_addr: SocketAddr,

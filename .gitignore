@@ -4,10 +4,10 @@
 Cargo.lock.bak
 
 # Precompiled/loaded binaries (regenerate with `cargo build --release`)
-/mimir
-/mimir-rs
-/mimir-xdp-ebpf
-/mimir-xdp-sync
+/runut
+/runut
+/runut-xdp-ebpf
+/runut-xdp-sync
 /xdp-sync-bridge-v2.7
 
 # Environment / secrets

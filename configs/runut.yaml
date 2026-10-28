@@ -1,4 +1,4 @@
-# MIMIR-RS Configuration
+# RUNUT Configuration
 
 listen:
   udp: "0.0.0.0:53"
@@ -38,10 +38,10 @@ blocklist:
     - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
   refresh_interval_secs: 3600
 
-svalinn:
+tameng:
   enabled: false
   url: "https://your-shield-instance.example.com"
-  api_key: "${SVALINN_API_KEY}"
+  api_key: "${TAMENG_API_KEY}"
   sync_interval_secs: 300
 
 # DGA (Domain Generation Algorithm) heuristic detection -- alert-only, logs

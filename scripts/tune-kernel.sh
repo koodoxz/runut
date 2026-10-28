@@ -1,10 +1,10 @@
 #!/bin/bash
-# MIMIR-RS Linux Kernel Tuning Script
+# RUNUT Linux Kernel Tuning Script
 # Optimizes network stack for ultra-fast DNS performance
 #
 # Run as root: sudo ./tune-kernel.sh
 
-echo "🔥 MIMIR-RS Kernel Tuning Script"
+echo "🔥 RUNUT Kernel Tuning Script"
 echo "================================"
 
 # Check if running as root
@@ -56,7 +56,7 @@ echo ">>> Persisting Settings..."
 
 cat >> /etc/sysctl.conf << 'EOF'
 
-# MIMIR-RS Performance Tuning
+# RUNUT Performance Tuning
 net.core.rmem_max=26214400
 net.core.rmem_default=1048576
 net.core.wmem_max=26214400
@@ -73,7 +73,7 @@ EOF
 # Add file descriptor limits
 cat >> /etc/security/limits.conf << 'EOF'
 
-# MIMIR-RS File Descriptor Limits
+# RUNUT File Descriptor Limits
 * soft nofile 1048576
 * hard nofile 1048576
 root soft nofile 1048576
@@ -83,8 +83,8 @@ EOF
 echo ""
 echo "✅ Kernel tuning complete!"
 echo ""
-echo "Recommended MIMIR-RS start command:"
-echo "  sudo ./mimir --workers \$(nproc) --listen 0.0.0.0:53"
+echo "Recommended RUNUT start command:"
+echo "  sudo ./runut --workers \$(nproc) --listen 0.0.0.0:53"
 echo ""
 echo "For multi-core VPS:"
 echo "  2 cores: ~60K QPS"

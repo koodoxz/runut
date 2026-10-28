@@ -1,7 +1,7 @@
-//! MIMIR-XDP Sync Bridge
+//! RUNUT-XDP Sync Bridge
 //! 
 //! Lightweight sync bridge that connects to an existing DNS_CACHE eBPF map
-//! (loaded by an external XDP loader) and updates it with DNS cache entries from MIMIR-RS.
+//! (loaded by an external XDP loader) and updates it with DNS cache entries from RUNUT.
 //! 
 //! This fixes the byte-order bug in the Go xdp-sync-v5 version.
 
@@ -21,8 +21,8 @@ struct DnsResponse {
 unsafe impl aya::Pod for DnsResponse {}
 
 #[derive(Parser, Debug)]
-#[command(name = "mimir-xdp-sync")]
-#[command(about = "Sync bridge for MIMIR XDP DNS cache")]
+#[command(name = "runut-xdp-sync")]
+#[command(about = "Sync bridge for RUNUT XDP DNS cache")]
 struct Args {
     /// eBPF map ID for DNS_CACHE
     #[arg(long)]

@@ -1,28 +1,28 @@
-//! SVALINN DGA-event forwarding.
+//! TAMENG DGA-event forwarding.
 //!
-//! Sends a `DnsEvent` POST to a live, already-deployed SVALINN/"Tameng"
-//! receiver (github.com/aegis/svalinn, internal/server/handlers.go:2019)
-//! when MIMIR's DGA heuristic (see dga.rs) flags a query. This module only
+//! Sends a `DnsEvent` POST to a live, already-deployed TAMENG/"Tameng"
+//! receiver (github.com/koodoxz/tameng)
+//! when RUNUT's DGA heuristic (see dga.rs) flags a query. This module only
 //! builds the request shape and small stateless helpers (URL construction,
 //! failure-log rate limiting, wire-label domain escaping) -- the actual
 //! non-blocking dispatch (spawn, client reuse, and the ClientIP-availability
 //! decision) lives in
 //! server/mod.rs next to the DGA alert block it fires from, since that is
-//! where svalinn.enabled and the per-connection client address are both
+//! where tameng.enabled and the per-connection client address are both
 //! already in scope.
 
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Exact wire shape expected by the SVALINN receiver's `DNSEvent` struct
-/// (github.com/aegis/svalinn, internal/server/handlers.go:2019). Field
+/// Exact wire shape expected by the TAMENG receiver's `DNSEvent` struct
+/// (github.com/koodoxz/tameng). Field
 /// names/casing must match its `json:"..."` tags precisely -- `client_ip`
 /// and `domain` are REQUIRED server-side (400 if empty); the rest are
 /// optional there (`omitempty`).
 ///
 /// `api_key` is intentionally NOT part of this struct: it is sent as a
 /// header (`Authorization: Bearer ...`), not a body field -- see
-/// `server/mod.rs`'s `maybe_send_svalinn_dga_event`. Authentication on the
+/// `server/mod.rs`'s `maybe_send_tameng_dga_event`. Authentication on the
 /// receiver today is IP-allowlist only; the header is forward-compatible
 /// but not yet enforced server-side (documented there, not here, since
 /// this module has no knowledge of transport/headers).
@@ -42,14 +42,14 @@ pub struct DnsEvent {
     pub source: Option<String>,
 }
 
-/// Builds the full `/api/v1/dns-events` URL from `svalinn.url`, handling
+/// Builds the full `/api/v1/dns-events` URL from `tameng.url`, handling
 /// both a trailing-slash and no-trailing-slash base URL so the result is
 /// never malformed.
 pub fn build_dns_events_url(base_url: &str) -> String {
     format!("{}/api/v1/dns-events", base_url.trim_end_matches('/'))
 }
 
-/// Builds the outbound `domain` string for a SVALINN DGA event from raw
+/// Builds the outbound `domain` string for a TAMENG DGA event from raw
 /// wire-format DNS label bytes (most-specific label first), WITHOUT calling
 /// `Name::to_string()` (the exact vulnerability this feature's DGA scoring
 /// already avoids -- see `dga.rs`'s module doc comment) and WITHOUT
@@ -85,7 +85,7 @@ pub fn build_dns_events_url(base_url: &str) -> String {
 ///    contain any byte, including raw control characters (`\n`, `\r`,
 ///    ANSI/terminal escape sequences, `0x7f` DEL, etc.) -- these would
 ///    otherwise pass straight through into the `domain` field sent to the
-///    external SVALINN receiver, which is exactly the log/data-forgery
+///    external TAMENG receiver, which is exactly the log/data-forgery
 ///    class this codebase already guards against at the local `warn!` call
 ///    site in `server/mod.rs` (Debug-escaped there for the same reason,
 ///    per that call site's own comment). This escaping only ever fires for
@@ -139,21 +139,21 @@ pub fn build_alert_domain(labels: &[&[u8]]) -> Option<String> {
     Some(parts.join("."))
 }
 
-/// Minimum interval between logged SVALINN POST-failure warnings. The
+/// Minimum interval between logged TAMENG POST-failure warnings. The
 /// per-domain LRU dedup (`DnsServer::dga_alert_seen`) already prevents
-/// re-alerting on the *same* label, but a sustained SVALINN outage
+/// re-alerting on the *same* label, but a sustained TAMENG outage
 /// combined with traffic cycling through many *distinct* DGA-scoring
 /// domains could otherwise still log one `warn!` per distinct domain -- a
 /// second, narrower log-flood vector. This gate caps how often the
 /// failure itself is logged, independent of which domain triggered it.
 const FAILURE_LOG_INTERVAL_MS: u64 = 30_000;
 
-/// Returns true if a SVALINN POST-failure warning should be logged right
+/// Returns true if a TAMENG POST-failure warning should be logged right
 /// now, atomically claiming the slot so concurrent callers don't all log
 /// at once. Never panics: a system-clock error before the UNIX epoch
 /// fails open (logs) rather than panicking or silently suppressing all
 /// future failure logs forever.
-pub fn should_log_svalinn_failure(gate: &AtomicU64) -> bool {
+pub fn should_log_tameng_failure(gate: &AtomicU64) -> bool {
     let now_ms = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_millis() as u64,
         Err(_) => {
@@ -187,16 +187,16 @@ mod tests {
     #[test]
     fn url_builds_correctly_without_trailing_slash() {
         assert_eq!(
-            build_dns_events_url("https://shield.svalinn.id"),
-            "https://shield.svalinn.id/api/v1/dns-events"
+            build_dns_events_url("https://tameng.example.com"),
+            "https://tameng.example.com/api/v1/dns-events"
         );
     }
 
     #[test]
     fn url_builds_correctly_with_trailing_slash() {
         assert_eq!(
-            build_dns_events_url("https://shield.svalinn.id/"),
-            "https://shield.svalinn.id/api/v1/dns-events"
+            build_dns_events_url("https://tameng.example.com/"),
+            "https://tameng.example.com/api/v1/dns-events"
         );
     }
 
@@ -221,7 +221,7 @@ mod tests {
             reason: "high_entropy,long_consonant_run".to_string(),
             actor_id: None,
             timestamp: None,
-            source: Some("mimir".to_string()),
+            source: Some("runut".to_string()),
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "dga");
@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(json["domain"], "xkjqwzpqmnbvcxzl.com");
         assert_eq!(json["score"], 0.85);
         assert_eq!(json["reason"], "high_entropy,long_consonant_run");
-        assert_eq!(json["source"], "mimir");
+        assert_eq!(json["source"], "runut");
         // Optional None fields must be omitted, not emitted as null --
         // matches Go's `omitempty` on ActorID/Timestamp.
         assert!(json.get("actor_id").is_none());
@@ -246,7 +246,7 @@ mod tests {
             reason: "high_entropy".to_string(),
             actor_id: Some("actor-123".to_string()),
             timestamp: Some("2026-08-06T00:00:00Z".to_string()),
-            source: Some("mimir".to_string()),
+            source: Some("runut".to_string()),
         };
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["actor_id"], "actor-123");
@@ -257,11 +257,11 @@ mod tests {
     fn failure_log_gate_allows_first_call_and_suppresses_immediate_repeat() {
         let gate = AtomicU64::new(0);
         assert!(
-            should_log_svalinn_failure(&gate),
+            should_log_tameng_failure(&gate),
             "first call should log (gate starts at epoch 0, far in the past)"
         );
         assert!(
-            !should_log_svalinn_failure(&gate),
+            !should_log_tameng_failure(&gate),
             "immediate repeat within the interval must be suppressed"
         );
     }
@@ -269,12 +269,12 @@ mod tests {
     #[test]
     fn failure_log_gate_allows_logging_again_after_interval_elapsed() {
         let gate = AtomicU64::new(0);
-        assert!(should_log_svalinn_failure(&gate));
+        assert!(should_log_tameng_failure(&gate));
         // Manually rewind the gate to simulate the interval having elapsed,
         // rather than sleeping in a unit test.
         gate.store(0, Ordering::Relaxed);
         assert!(
-            should_log_svalinn_failure(&gate),
+            should_log_tameng_failure(&gate),
             "resetting the gate to epoch 0 must allow logging again"
         );
     }

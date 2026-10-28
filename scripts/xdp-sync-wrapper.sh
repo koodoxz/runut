@@ -16,4 +16,4 @@ if [ -z "$CACHE_ID" ]; then
 fi
 
 echo "✅ Starting XDP Sync with DNS_CACHE map ID $CACHE_ID"
-exec /opt/mimir-xdp/xdp-sync-v5 --map-id $CACHE_ID --sync-addr 127.0.0.1:9154 --stats-interval 30
+exec /opt/runut-xdp/xdp-sync-v5 --map-id $CACHE_ID --sync-addr 127.0.0.1:9154 --stats-interval 30

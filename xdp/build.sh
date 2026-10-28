@@ -1,10 +1,10 @@
 #!/bin/bash
-# MIMIR-XDP Build Script
+# RUNUT-XDP Build Script
 # Builds both eBPF and userspace components
 
 set -e
 
-echo "🔥 Building MIMIR-XDP..."
+echo "🔥 Building RUNUT-XDP..."
 echo ""
 
 # Check for required tools
@@ -24,13 +24,13 @@ rustup target add bpfel-unknown-none 2>/dev/null || true
 
 echo ""
 echo ">>> Building eBPF program..."
-cd mimir-xdp-ebpf
+cd runut-xdp-ebpf
 cargo build --release --target bpfel-unknown-none -Z build-std=core
 cd ..
 
 echo ""
 echo ">>> Building userspace loader..."
-cd mimir-xdp
+cd runut-xdp
 cargo build --release
 cd ..
 
@@ -38,9 +38,9 @@ echo ""
 echo "✅ Build complete!"
 echo ""
 echo "Binaries:"
-echo "  eBPF:      target/bpfel-unknown-none/release/mimir-xdp-ebpf"
-echo "  Loader:    mimir-xdp/target/release/mimir-xdp"
+echo "  eBPF:      target/bpfel-unknown-none/release/runut-xdp-ebpf"
+echo "  Loader:    runut-xdp/target/release/runut-xdp"
 echo ""
 echo "Usage:"
-echo "  sudo ./mimir-xdp/target/release/mimir-xdp --interface eth0 --mode native"
+echo "  sudo ./runut-xdp/target/release/runut-xdp --interface eth0 --mode native"
 echo ""

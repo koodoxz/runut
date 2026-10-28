@@ -1,4 +1,4 @@
-//! MIMIR-RS Configuration Module
+//! RUNUT Configuration Module
 //! 
 //! Handles YAML configuration parsing and validation.
 
@@ -34,16 +34,16 @@ pub struct Config {
     pub blocklist: BlocklistConfig,
 
     /// DGA (Domain Generation Algorithm) heuristic detection -- alert-only,
-    /// no block capability. MIMIR-DGA-DETECT-001.
+    /// no block capability. RUNUT-DGA-DETECT-001.
     #[serde(default)]
     pub dga: DgaConfig,
 
-    /// SVALINN integration
+    /// TAMENG integration
     #[serde(default)]
-    pub svalinn: SvalinnConfig,
+    pub tameng: TamengConfig,
 
     /// DNS-tunneling heuristic detection -- alert-only, no block capability.
-    /// MIMIR-DNS-TUNNEL-DETECT-001.
+    /// RUNUT-DNS-TUNNEL-DETECT-001.
     #[serde(default)]
     pub tunnel: TunnelConfig,
     
@@ -283,7 +283,7 @@ impl Default for DgaConfig {
 fn default_dga_threshold() -> f64 { 0.5 }
 
 /// DNS-tunneling heuristic detection configuration
-/// (MIMIR-DNS-TUNNEL-DETECT-001). Ships disabled by default, same rationale
+/// (RUNUT-DNS-TUNNEL-DETECT-001). Ships disabled by default, same rationale
 /// as `DgaConfig` above -- a new detector on a live production resolver
 /// should be an explicit opt-in. Alert-only; has no block/deny capability in
 /// this REQ. See src/tunnel.rs for the distinct-subdomain-per-domain design
@@ -356,12 +356,12 @@ fn default_tunnel_outer_capacity() -> usize { 2000 }
 fn default_tunnel_inner_capacity() -> usize { 256 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct SvalinnConfig {
-    /// Enable SVALINN integration
+pub struct TamengConfig {
+    /// Enable TAMENG integration
     #[serde(default)]
     pub enabled: bool,
     
-    /// SVALINN API URL
+    /// TAMENG API URL
     #[serde(default)]
     pub url: String,
     
@@ -380,7 +380,7 @@ pub struct SvalinnConfig {
     pub sync_interval_secs: u64,
 }
 
-impl Default for SvalinnConfig {
+impl Default for TamengConfig {
     fn default() -> Self {
         Self {
             enabled: false,
@@ -472,7 +472,7 @@ impl Config {
         // once, at load time -- rather than re-checking (or panicking) per
         // query -- means `TunnelTracker::new` can rely on an
         // already-validated value, the same fail-loudly-at-load rationale
-        // as the dga.threshold/svalinn.url checks in this function.
+        // as the dga.threshold/tameng.url checks in this function.
         if config.tunnel.tracker_outer_capacity == 0 {
             anyhow::bail!("tunnel.tracker_outer_capacity must be > 0, got 0");
         }
@@ -501,19 +501,19 @@ impl Config {
                 config.tunnel.tracker_inner_capacity
             );
         }
-        // svalinn.enabled with a missing/malformed url would silently no-op
+        // tameng.enabled with a missing/malformed url would silently no-op
         // every DGA event (the client still builds, every send just fails)
         // instead of telling the operator at startup that the integration
         // they turned on cannot actually reach anywhere -- same
         // fail-loudly-at-load rationale as the dga.threshold check above.
-        if config.svalinn.enabled {
-            let url_is_valid = reqwest::Url::parse(&config.svalinn.url)
+        if config.tameng.enabled {
+            let url_is_valid = reqwest::Url::parse(&config.tameng.url)
                 .map(|u| u.scheme() == "http" || u.scheme() == "https")
                 .unwrap_or(false);
             if !url_is_valid {
                 anyhow::bail!(
-                    "svalinn.url must be a well-formed http(s):// URL when svalinn.enabled is true, got {:?}",
-                    config.svalinn.url
+                    "tameng.url must be a well-formed http(s):// URL when tameng.enabled is true, got {:?}",
+                    config.tameng.url
                 );
             }
         }
@@ -522,11 +522,11 @@ impl Config {
     
     /// Expand environment variables in config values
     pub fn expand_env(&mut self) {
-        // Expand SVALINN API key
-        if self.svalinn.api_key.starts_with("${") && self.svalinn.api_key.ends_with("}") {
-            let var_name = &self.svalinn.api_key[2..self.svalinn.api_key.len()-1];
+        // Expand TAMENG API key
+        if self.tameng.api_key.starts_with("${") && self.tameng.api_key.ends_with("}") {
+            let var_name = &self.tameng.api_key[2..self.tameng.api_key.len()-1];
             if let Ok(value) = std::env::var(var_name) {
-                self.svalinn.api_key = value;
+                self.tameng.api_key = value;
             }
         }
     }
@@ -569,7 +569,7 @@ upstream:
     // `serde_yaml::from_str` directly, bypassing `Config::load` entirely --
     // which means none of the six `bail!` validation arms in `load` (the
     // dga.threshold range check, the four tunnel.* checks including the
-    // MEDIUM-1 fix added this session, and the svalinn.url check) were ever
+    // MEDIUM-1 fix added this session, and the tameng.url check) were ever
     // exercised by CI, despite each having a detailed doc comment justifying
     // why it exists. Found in review (round 2 of the tunnel-detection Opus
     // judge chain, MEDIUM): a future refactor could silently weaken or drop
@@ -587,7 +587,7 @@ upstream:
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "mimir-config-load-test-{}-{}.yaml",
+            "runut-config-load-test-{}-{}.yaml",
             std::process::id(),
             n
         ));
@@ -692,22 +692,22 @@ upstream:
     }
 
     #[test]
-    fn config_load_rejects_malformed_svalinn_url_when_enabled() {
+    fn config_load_rejects_malformed_tameng_url_when_enabled() {
         let path = write_temp_config(
-            "mode: recursive\nsvalinn:\n  enabled: true\n  url: \"not a url\"\n",
+            "mode: recursive\ntameng:\n  enabled: true\n  url: \"not a url\"\n",
         );
         let _guard = TempConfigFile(path.clone());
-        let err = Config::load(&path).expect_err("malformed svalinn.url with svalinn.enabled=true must be rejected");
-        assert!(err.to_string().contains("svalinn.url"), "unexpected error: {err}");
+        let err = Config::load(&path).expect_err("malformed tameng.url with tameng.enabled=true must be rejected");
+        assert!(err.to_string().contains("tameng.url"), "unexpected error: {err}");
     }
 
     #[test]
-    fn config_load_ignores_malformed_svalinn_url_when_disabled() {
-        // svalinn.enabled defaults to false -- a malformed url must NOT
+    fn config_load_ignores_malformed_tameng_url_when_disabled() {
+        // tameng.enabled defaults to false -- a malformed url must NOT
         // block startup when the integration itself is off.
-        let path = write_temp_config("mode: recursive\nsvalinn:\n  url: \"not a url\"\n");
+        let path = write_temp_config("mode: recursive\ntameng:\n  url: \"not a url\"\n");
         let _guard = TempConfigFile(path.clone());
         let result = Config::load(&path);
-        assert!(result.is_ok(), "malformed url must be ignored when svalinn.enabled=false: {:?}", result.err());
+        assert!(result.is_ok(), "malformed url must be ignored when tameng.enabled=false: {:?}", result.err());
     }
 }

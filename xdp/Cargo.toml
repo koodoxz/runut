@@ -1,7 +1,7 @@
 [workspace]
 members = [
-    "mimir-xdp",
-    "mimir-xdp-ebpf",
+    "runut-xdp",
+    "runut-xdp-ebpf",
 ]
 resolver = "2"
 

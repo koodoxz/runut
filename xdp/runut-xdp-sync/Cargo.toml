@@ -1,8 +1,8 @@
 [package]
-name = "mimir-xdp-sync"
+name = "runut-xdp-sync"
 version = "1.0.0"
 edition = "2021"
-description = "Lightweight sync bridge for MIMIR XDP DNS cache"
+description = "Lightweight sync bridge for RUNUT XDP DNS cache"
 
 [workspace]
 

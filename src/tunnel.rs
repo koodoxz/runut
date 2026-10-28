@@ -1,6 +1,6 @@
 //! DNS-tunneling heuristic detection.
 //!
-//! REQ MIMIR-DNS-TUNNEL-DETECT-001. Alert-only, logs and counts, never
+//! REQ RUNUT-DNS-TUNNEL-DETECT-001. Alert-only, logs and counts, never
 //! blocks or alters resolution -- same posture as `dga.rs`'s DGA detector,
 //! which this module deliberately does NOT duplicate or replace (see
 //! `dga.rs`'s own module doc comment, which flags this exact feature as a
@@ -46,7 +46,7 @@
 //! below for the fuzz sweep this is checked against.
 
 use crate::dga;
-use crate::svalinn;
+use crate::tameng;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -89,7 +89,7 @@ const LONG_LABEL_RATIO_THRESHOLD: f64 = 0.8;
 /// domain. Outer LRU keyed on the registrable domain's raw label bytes,
 /// mapping to an inner fixed-capacity LRU of distinct subdomain-chains seen
 /// for that domain -- both LRUs, not hash sets, for the same reason
-/// `dga_alert_seen`/`svalinn_send_seen` in server/mod.rs are LRUs: a fixed
+/// `dga_alert_seen`/`tameng_send_seen` in server/mod.rs are LRUs: a fixed
 /// memory bound under attacker-controlled cardinality, at the cost of
 /// evicted entries "forgetting" and being re-counted from scratch (accepted
 /// imprecision, documented on `record` below).
@@ -116,7 +116,7 @@ const LONG_LABEL_RATIO_THRESHOLD: f64 = 0.8;
 /// (`[b"ab", b"c"]` and `[b"a", b"bc"]` hash differently -- see
 /// `record_label_boundary_split_of_same_total_bytes_are_distinct_chains`
 /// below). This deliberately does NOT reimplement hashing via manual
-/// concatenation of the label bytes -- see `dga.rs`'s and `svalinn.rs`'s own
+/// concatenation of the label bytes -- see `dga.rs`'s and `tameng.rs`'s own
 /// doc comments on why a naive join/concatenation of wire-format labels is
 /// unsafe in general (the exact desync bug class this codebase has already
 /// been burned by and carries dedicated regression tests against).
@@ -179,7 +179,7 @@ impl TunnelTracker {
     /// checks) specifically so this constructor -- called once at startup
     /// from `DnsServer::new`, never per-query -- can rely on an
     /// already-validated value rather than needing to fail gracefully at
-    /// runtime. Mirrors `dga_alert_seen`'s/`svalinn_send_seen`'s own
+    /// runtime. Mirrors `dga_alert_seen`'s/`tameng_send_seen`'s own
     /// `NonZeroUsize::new(...).unwrap()` construction in server/mod.rs.
     pub fn new(outer_capacity: usize, inner_capacity: usize) -> Self {
         let outer_cap = NonZeroUsize::new(outer_capacity)
@@ -246,14 +246,14 @@ impl TunnelTracker {
 }
 
 /// A DNS-tunneling suspicion score in [0.0, 1.0] plus supporting detail, for
-/// logging/SVALINN forwarding.
+/// logging/TAMENG forwarding.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TunnelScore {
     pub score: f64,
     pub distinct_count: usize,
     /// Safely escaped, UTF-8-validated display form of the registrable
-    /// domain (via `svalinn::build_alert_domain`) -- suitable for logging
-    /// and as the outbound SVALINN `domain` field. NOT a raw/lossy decode;
+    /// domain (via `tameng::build_alert_domain`) -- suitable for logging
+    /// and as the outbound TAMENG `domain` field. NOT a raw/lossy decode;
     /// see `evaluate`'s doc comment for why the whole call fails (`None`)
     /// rather than falling back to a placeholder when this can't be built.
     pub registrable_domain: String,
@@ -339,14 +339,14 @@ const SCORE_HEADROOM_MULTIPLIER: f64 = 2.0;
 ///    itself returns `None`) -- nothing to key a domain on; `tracker` is
 ///    NOT touched in this case.
 /// 2. `distinct_count < threshold` -- recorded, just not (yet) suspicious.
-/// 3. The registrable domain's labels fail `svalinn::build_alert_domain`'s
+/// 3. The registrable domain's labels fail `tameng::build_alert_domain`'s
 ///    UTF-8 validation -- recorded (the tracker itself operates on raw
 ///    bytes and doesn't need UTF-8), but there is no way to produce a safe
 ///    `registrable_domain` display string, so the event is skipped entirely
 ///    rather than sent with a placeholder/lossy-decoded domain. This means
 ///    a domain that is otherwise over-threshold but has non-UTF-8
 ///    registrable-domain labels never alerts -- an accepted limitation
-///    matching `dga.rs`'s and `svalinn::build_alert_domain`'s own
+///    matching `dga.rs`'s and `tameng::build_alert_domain`'s own
 ///    established "skip, never lossy-decode" contract.
 pub fn evaluate(
     tracker: &TunnelTracker,
@@ -363,7 +363,7 @@ pub fn evaluate(
     }
 
     let registrable_label_refs: Vec<&[u8]> = registrable_labels.iter().map(Vec::as_slice).collect();
-    let registrable_domain = svalinn::build_alert_domain(&registrable_label_refs)?;
+    let registrable_domain = tameng::build_alert_domain(&registrable_label_refs)?;
 
     let mut reasons = vec!["high_distinct_subdomain_count"];
     reasons.extend(static_reasons(&subdomain_labels, qtype));
@@ -423,7 +423,7 @@ mod tests {
     /// silently collapse these two into one entry, permanently
     /// undercounting `distinct_count` for any domain whose tunneling
     /// payload happens to straddle a label boundary differently between
-    /// queries -- exactly the desync bug class `dga.rs`'s and `svalinn.rs`'s
+    /// queries -- exactly the desync bug class `dga.rs`'s and `tameng.rs`'s
     /// own doc comments warn about for naive joins.
     #[test]
     fn record_label_boundary_split_of_same_total_bytes_are_distinct_chains() {

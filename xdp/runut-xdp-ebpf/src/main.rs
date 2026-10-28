@@ -1,4 +1,4 @@
-//! MIMIR-XDP eBPF Program v0.4.4
+//! RUNUT-XDP eBPF Program v0.4.4
 //!
 //! "THE MONSTER" - Fixed Pointer Syntax for XDP_TX.
 //! Full raw pointer arithmetic for verifier-safe header rewrites.
@@ -38,15 +38,15 @@ const STAT_LAST_HASH_HIGH: u32 = 11;
 const STAT_LAST_QNAME_LEN: u32 = 12;
 
 #[xdp]
-pub fn mimir_xdp(ctx: XdpContext) -> u32 {
-    match try_mimir_xdp(&ctx) {
+pub fn runut_xdp(ctx: XdpContext) -> u32 {
+    match try_runut_xdp(&ctx) {
         Ok(ret) => ret,
         Err(_) => xdp_action::XDP_PASS,
     }
 }
 
 #[inline(always)]
-fn try_mimir_xdp(ctx: &XdpContext) -> Result<u32, ()> {
+fn try_runut_xdp(ctx: &XdpContext) -> Result<u32, ()> {
     increment_stat(STAT_PACKETS_TOTAL);
     
     let data = ctx.data() as *mut u8;

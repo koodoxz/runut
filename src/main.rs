@@ -1,4 +1,4 @@
-//! MIMIR-RS - Ultra Blazzing Fast DNS Guardian
+//! RUNUT - Ultra Blazzing Fast DNS Guardian
 //!
 //! A high-performance DNS server built in Rust with:
 //! - Zero GC latency
@@ -20,22 +20,22 @@ mod filter;
 mod forwarder;
 mod metrics;
 mod resolver;  // Recursive resolver (NO 3rd-party upstream)
-mod svalinn;
+mod tameng;
 mod tunnel;
 mod xdp;
 
 use config::Config;
 use server::DnsServer;
 
-/// MIMIR-RS DNS Guardian
+/// RUNUT DNS Guardian
 #[derive(Parser, Debug)]
-#[command(name = "mimir")]
+#[command(name = "runut")]
 #[command(author = "Runut Contributors")]
 #[command(version = "0.2.0")]
 #[command(about = "Ultra Blazzing Fast DNS Guardian - Rust Edition")]
 struct Args {
     /// Path to configuration file
-    #[arg(short, long, default_value = "configs/mimir.yaml")]
+    #[arg(short, long, default_value = "configs/runut.yaml")]
     config: String,
     
     /// Listen address (overrides config)
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(num_workers)
         .enable_all()
-        .thread_name("mimir-worker")
+        .thread_name("runut-worker")
         .build()?;
     
     runtime.block_on(async_main(args, num_workers))
@@ -93,7 +93,7 @@ async fn async_main(args: Args, num_workers: usize) -> Result<()> {
     // Print banner
     print_banner();
     
-    info!("🔥 MIMIR-RS starting with {} worker threads", num_workers);
+    info!("🔥 RUNUT starting with {} worker threads", num_workers);
     
     // Load configuration
     let mut config = match Config::load(&args.config) {
@@ -248,7 +248,7 @@ impl Default for Config {
             cache: Default::default(),
             blocklist: Default::default(),
             dga: Default::default(),
-            svalinn: Default::default(),
+            tameng: Default::default(),
             tunnel: Default::default(),
             metrics: Default::default(),
             logging: Default::default(),

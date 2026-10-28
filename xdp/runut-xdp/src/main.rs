@@ -1,8 +1,8 @@
-//! MIMIR-XDP Userspace Loader v0.3
+//! RUNUT-XDP Userspace Loader v0.3
 //!
 //! Features:
 //! - Loads XDP program onto network interface
-//! - UDP Sync Server (port 9154) to receive cache from MIMIR-RS
+//! - UDP Sync Server (port 9154) to receive cache from RUNUT
 //! - Real-time statistics monitoring
 //! - Full cache population in eBPF maps
 
@@ -39,9 +39,9 @@ const STAT_LAST_HASH_HIGH: u32 = 11;
 const STAT_LAST_QNAME_LEN: u32 = 12;
 
 #[derive(Parser, Debug)]
-#[command(name = "mimir-xdp")]
+#[command(name = "runut-xdp")]
 #[command(version = "0.3.0")]
-#[command(about = "Ultra-fast XDP DNS accelerator for MIMIR-RS")]
+#[command(about = "Ultra-fast XDP DNS accelerator for RUNUT")]
 struct Args {
     #[arg(short, long, default_value = "eth0")]
     interface: String,
@@ -49,7 +49,7 @@ struct Args {
     #[arg(short, long, default_value = "skb")]
     mode: String,
     
-    #[arg(short, long, default_value = "../target/bpfel-unknown-none/release/mimir-xdp-ebpf")]
+    #[arg(short, long, default_value = "../target/bpfel-unknown-none/release/runut-xdp-ebpf")]
     ebpf: String,
     
     #[arg(short, long, default_value = "127.0.0.1:9154")]
@@ -74,13 +74,13 @@ async fn main() -> Result<()> {
     
     print_banner();
     
-    info!("🚀 Loading MIMIR-XDP v0.3...");
+    info!("🚀 Loading RUNUT-XDP v0.3...");
     
     let ebpf_data = std::fs::read(&args.ebpf).context("Failed to read eBPF object file")?;
     let mut ebpf = Ebpf::load(&ebpf_data).context("Failed to load eBPF program")?;
     
     
-    let program: &mut Xdp = ebpf.program_mut("mimir_xdp").context("XDP program not found")?.try_into()?;
+    let program: &mut Xdp = ebpf.program_mut("runut_xdp").context("XDP program not found")?.try_into()?;
     program.load()?;
     
     // Use direct assignment instead of UPDATE_IF_NOEXIST to improve compatibility
@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
             }
             
             _ = signal::ctrl_c() => {
-                info!("Stopping MIMIR-XDP...");
+                info!("Stopping RUNUT-XDP...");
                 break;
             }
         }
