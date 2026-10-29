@@ -3,6 +3,7 @@
 > **High-Performance Autonomous DNS Guardian — Engineered in Rust**  
 > Sub-millisecond latency, zero garbage collection, multi-protocol resolution, and real-time active threat defense.
 
+[![CI](https://github.com/koodoxz/runut/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/koodoxz/runut/actions)
 [![Rust](https://img.shields.io/badge/Rust-1.75+-000000?style=flat&logo=rust)](https://www.rust-lang.org/)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Protocols](https://img.shields.io/badge/Protocols-UDP%20%7C%20TCP%20%7C%20DoT%20%7C%20DoH%20%7C%20DoQ-green.svg)](#architecture--modes)
