@@ -6,6 +6,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.75+-000000?style=flat&logo=rust)](https://www.rust-lang.org/)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0--or--later-blue.svg)](LICENSE)
 [![Protocols](https://img.shields.io/badge/Protocols-UDP%20%7C%20TCP%20%7C%20DoT%20%7C%20DoH%20%7C%20DoQ-green.svg)](#architecture--modes)
+[![Ecosystem](https://img.shields.io/badge/Ecosystem-Architecture%20Portal-00f2fe.svg)](https://koodoxz.github.io)
 
 ---
 
@@ -56,9 +57,10 @@ Runut operates as the core resolution brain within a unified, defense-in-depth s
 | :--- | :--- | :--- |
 | **[Tameng](https://github.com/koodoxz/tameng)** | Layer 7 (Application) | Autonomous Web Application Firewall, Behavioral Defense, and Threat Intelligence Hub |
 | **[Runut](https://github.com/koodoxz/runut)** | Layer 7 (DNS Core) | High-Performance Zero-GC Recursive Root Resolver and DGA/Tunneling Sentinel |
-| **Gapura** *(Coming Soon)* | Ingress Gateway | Public entry portal terminating DoH, DoT, and DoQ with token-bucket rate limiting |
-| **Kalas** *(Coming Soon)* | Layer 3 & 4 (Kernel) | eBPF/XDP sentinel dropping packet floods (SYN flood, port scans) at wire speed |
-| **Caraka** *(Coming Soon)* | Client / Edge | Zero-round-trip local proxy forwarding endpoint queries over encrypted QUIC |
+| **[Gapura](https://github.com/koodoxz/gapura)** | Ingress Gateway | Public entry portal terminating DoH, DoT, and DoQ with token-bucket rate limiting |
+| **[Kalas](https://github.com/koodoxz/kalas)** | Layer 3 & 4 (Kernel) | eBPF/XDP sentinel dropping packet floods (SYN flood, port scans) at wire speed |
+| **[Caraka](https://github.com/koodoxz/caraka)** | Client / Edge | Zero-round-trip local proxy forwarding endpoint queries over encrypted QUIC |
+| **[Architecture Portal](https://koodoxz.github.io)** | Web Overview | Interactive architectural pipeline visualization and ecosystem specifications |
 
 ---
 
